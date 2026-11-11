@@ -6,23 +6,25 @@ One engine, two dashboards:
     python dow_dashboard.py       ->  http://127.0.0.1:8051   (Dow 30,     market filter = DIA)
     (or: python momentum_dashboard.py nasdaq | dow)
 
-Mirrors the latest QuantConnect algo (the QQQ version):
+Rules shared by both (each mirrors its own QuantConnect algo):
   * Trend      : a stock qualifies while its 10-day SMA > 200-day SMA AND price > 200-day SMA,
-                 and blended momentum is positive (mom_positive = blend | all | off).
-  * Momentum   : 21 / 63 / 126-day returns, ranked (average rank) or averaged (return).
-  * TEO filter : qualifying stocks whose Trend Efficiency Oscillator stage is EXHAUSTING are removed BEFORE ranking;
-                 the top 10 come from the rest. TEO = signed Kaufman efficiency ratio (21d), EMA-smoothed (7),
-                 stage from the 6-day direction-aware slope. Breadth is not affected.
-  * Breadth    : risk-off if breadth_min (Nasdaq 30%, Dow 40%) OR FEWER of the members qualify -> hold nothing.
-  * Momentum   : Nasdaq 21 + 126 days, Dow 21 + 63 + 126 days.
-  * Index SMA  : the algo also goes to cash on a FRESH cross of the market ETF (QQQ / DIA) below its 200-day SMA,
-                 judged at the daily close. Both filters are checked at every close; once out, the algo stays in cash
-                 until the next Monday rebalance, and resumes there if breadth is above breadth_min.
-  * Picks      : top 10, each gets  size x leverage / 10  of the account (leverage 2.5).
-  * Vol target : Nasdaq only (Dow: off, always 100% deployed).
-                 size (share of the account deployed, 0-100%) = vol_target (35%) / (leverage x basket vol);
-                 basket vol = realized vol of the top-10 basket (weights 1/10) over 21 and 63 days, the higher one.
-  * Stop       : none per stock - holdings change only at the rebalance or when a market filter trips.
+                 and blended 21 / 63 / 126-day momentum is positive (mom_positive = blend | all | off).
+  * Picks      : the top 10 by momentum (average rank on each lookback), each gets size x leverage / 10.
+  * Breadth    : risk-off if 40% OR FEWER of the members qualify -> hold nothing.
+  * Index SMA  : a FRESH cross of the market ETF (QQQ / DIA) below its 200-day SMA also goes to cash. Once out, the
+                 algo stays in cash until the next Monday rebalance, and resumes there if breadth is above 40%.
+
+NASDAQ (QQQ top-30 algo):
+  * Universe   : the TOP 30 Nasdaq-100 members by QQQ FUND WEIGHT (Invesco's public QQQ holdings feed, looked up by
+                 QQQ's CUSIP 46090E103, pulled fresh at start, every hourly refresh and on
+                 Refresh; if Invesco can't be read, the backups are an exported holdings file, the last good pull,
+                 then Yahoo market cap, and the page says so). Members still come from CNBC. GOOG is
+                 dropped so Alphabet counts once. Breadth is measured on these 30 only.
+  * No TEO filter. Leverage 2.0. Vol target 35%: size = 0.35 / (2.0 x basket vol), capped at 100%.
+  * Stop       : a holding is sold on the first HOURLY close below its 200-day SMA (cash until the next rebalance).
+DOW (Dow 30 algo):
+  * Universe   : all 30 members. TEO filter on (Exhausting stocks removed before ranking). Leverage 2.5.
+                 No vol target (always 100% deployed). No per-stock stop.
 
 WHEN THE MARKET FILTERS ARE CHECKED ("Market checks" control; default per index):
   * Nasdaq: HOURLY - like the algo with filter_check=hourly. Every completed hourly bar since the last rebalance is
@@ -34,8 +36,7 @@ WHEN THE MARKET FILTERS ARE CHECKED ("Market checks" control; default per index)
   SMAs, momentum, TEO and basket vol always use completed daily bars.
 
 Members come from CNBC's index page (www.cnbc.com/nasdaq-100 or /dow-30). If CNBC can't be read, the dashboard falls
-back to Wikipedia's member table, then to the last list it saved (a json file next to this script), and says so in
-red at the top.
+back to the last list it saved (a json file next to this script), and says so in red at the top.
 
     pip install dash plotly pandas numpy yfinance requests lxml
 """
@@ -46,6 +47,7 @@ import math
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -67,13 +69,15 @@ DEFAULTS = dict(
 )
 INDEXES = {
     "nasdaq": dict(name="Nasdaq-100", bench="QQQ", port=8050, min_n=90, max_n=110, checks="hourly",
-                   momentum="21,126", breadth_min=0.30, vol_target=0.35,
+                   momentum="21,63,126", breadth_min=0.40, vol_target=0.35, leverage=2.0, teo_filter="off",
+                   index_top=30, exclude=["GOOG"], stop="hourly",       # QQQ top-30 algo
                    cnbc=["https://www.cnbc.com/nasdaq-100/", "https://www.cnbc.com/markets/nasdaq-100/"],
-                   wiki="https://en.wikipedia.org/wiki/Nasdaq-100", cache="ndx_constituents_cache.json"),
+                   cache="ndx_constituents_cache.json"),
     "dow": dict(name="Dow 30", bench="DIA", port=8051, min_n=28, max_n=32, checks="close",
-                momentum="21,63,126", breadth_min=0.40, vol_target=0.0,          # Dow: no vol target
+                momentum="21,63,126", breadth_min=0.40, vol_target=0.0, leverage=2.5, teo_filter="on",
+                index_top=0, exclude=[], stop="none",                     # Dow: no vol target, all 30 members
                 cnbc=["https://www.cnbc.com/dow-30/", "https://www.cnbc.com/markets/dow-30/"],
-                wiki="https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average", cache="dow_constituents_cache.json"),
+                cache="dow_constituents_cache.json"),
 }
 _arg = sys.argv[1].lower() if len(sys.argv) > 1 and sys.argv[1].lower() in INDEXES else None
 INDEX_KEY = _arg or os.environ.get("DASH_INDEX", "nasdaq").lower()
@@ -81,9 +85,11 @@ CFG = INDEXES[INDEX_KEY]
 BENCH = CFG["bench"]
 CACHE_FILE = Path(__file__).with_name(CFG["cache"])
 DEFAULTS["checks"] = CFG["checks"]                  # Nasdaq: hourly, Dow: at the close
-DEFAULTS["momentum"] = CFG["momentum"]              # Nasdaq: 21 + 126 days, Dow: 21 + 63 + 126
-DEFAULTS["breadth_min"] = CFG["breadth_min"]        # Nasdaq: 30%, Dow: 40%
+DEFAULTS["momentum"] = CFG["momentum"]              # 21 + 63 + 126 days
+DEFAULTS["breadth_min"] = CFG["breadth_min"]        # 40%
 DEFAULTS["vol_target"] = CFG["vol_target"]          # Nasdaq 35%, Dow off (always 100% deployed)
+DEFAULTS["leverage"] = CFG["leverage"]              # Nasdaq 2.0, Dow 2.5
+DEFAULTS["teo_filter"] = CFG["teo_filter"]          # Nasdaq off (top-30 algo has no TEO), Dow on
 ET = ZoneInfo("America/New_York")
 UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -155,30 +161,17 @@ def from_cnbc():
     raise RuntimeError(" | ".join(errs))
 
 
-def from_wikipedia():
-    r = requests.get(CFG["wiki"], headers=UA, timeout=20)
-    r.raise_for_status()
-    for t in pd.read_html(io.StringIO(r.text)):
-        for c in t.columns:
-            if str(c).strip().lower() in ("ticker", "symbol"):
-                tick = _clean(t[c].tolist())
-                if _plausible(tick):
-                    return dict(tickers=tick, weights={}, source=f"Wikipedia {CFG['name']} table",
-                                asof=dt.date.today().isoformat())
-    raise RuntimeError(f"{CFG['name']} table not found on Wikipedia")
-
-
 def from_cache():
     d = json.loads(CACHE_FILE.read_text())
     d["source"] = f"saved list ({d.get('source', '?')}, {d.get('asof', '?')})"
     return d
 
 
-SOURCES = {"cnbc": from_cnbc, "wikipedia": from_wikipedia}
+SOURCES = {"cnbc": from_cnbc}
 
 
 def get_members(choice="auto"):
-    order = ["cnbc", "wikipedia"] if choice == "auto" else [choice]
+    order = ["cnbc"]
     notes = []
     for name in order:
         try:
@@ -191,11 +184,148 @@ def get_members(choice="auto"):
             return d
         except Exception as e:  # noqa: BLE001
             notes.append(f"{name}: {e}")
-    if CACHE_FILE.exists():
+    if choice == "auto" and CACHE_FILE.exists():
         d = from_cache()
         d["notes"] = notes
         return d
     raise RuntimeError(f"Could not load {CFG['name']} members. " + " | ".join(notes))
+
+
+# ───────────────────────── top N by size (Nasdaq: top 30 of QQQ) ─────────────────────────
+def market_caps(tickers):
+    """Market cap per ticker from Yahoo (used to rank members; QQQ's fund weights follow market cap)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(t):
+        try:
+            fi = yf.Ticker(t).fast_info
+            try:
+                v = fi["marketCap"]
+            except Exception:  # noqa: BLE001
+                v = getattr(fi, "market_cap", None)
+            return t, float(v) if v else None
+        except Exception:  # noqa: BLE001
+            return t, None
+
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        return dict(ex.map(one, tickers))
+
+
+# Invesco's public QQQ holdings feed (the one behind invesco.com's QQQ page). It is looked up by QQQ's CUSIP
+# (46090E103); "interval=monthly" is part of the address but the file is refreshed every business day.
+INVESCO_URL = ("https://dng-api.invesco.com/cache/v1/accounts/en_US/shareclasses/46090E103/holdings/fund"
+               "?idType=cusip&interval=monthly&productType=ETF")
+INVESCO_HEADERS = {
+    "User-Agent": UA["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.invesco.com/qqq-etf/en/about.html",
+    "Origin": "https://www.invesco.com",
+}
+
+
+def fund_weights(retries=3):
+    """QQQ fund weights (% of the fund) by ticker from Invesco. Returns ({ticker: weight}, effective date).
+    Duplicate rows for the same ticker are added together; cash and non-stock rows are skipped."""
+    last = "no response"
+    for attempt in range(retries):
+        try:
+            r = requests.get(INVESCO_URL, headers=INVESCO_HEADERS, timeout=45)
+            if r.status_code != 200:
+                last = f"HTTP {r.status_code}: {r.text[:150]!r}"
+                raise RuntimeError(last)
+            payload = r.json()                       # an HTML / firewall page fails here
+            rows = payload.get("holdings")
+            if not isinstance(rows, list):
+                last = f"no 'holdings' list (keys: {list(payload)[:8]})"
+                raise RuntimeError(last)
+            w = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                c = _clean([row.get("ticker") or ""])
+                try:
+                    wt = float(row.get("percentageOfTotalNetAssets"))
+                except (TypeError, ValueError):
+                    continue
+                if c and wt > 0:
+                    w[c[0]] = w.get(c[0], 0.0) + wt
+            total = sum(w.values())
+            if len(w) < CFG["min_n"] or not 90 < total < 101:
+                last = f"unexpected holdings: {len(w)} tickers, total weight {total:.1f}%"
+                raise RuntimeError(last)
+            return w, str(payload.get("effectiveDate") or "")[:10]
+        except ValueError:
+            last = f"not JSON (probably blocked): {r.text[:150]!r}"
+        except Exception as e:  # noqa: BLE001
+            last = str(e) or last
+        if attempt < retries - 1:
+            time.sleep(2 ** attempt)
+    raise RuntimeError(last)
+
+
+def _parse_weights_table(t):
+    """{ticker: weight} from an Invesco holdings export table (Ticker / Holding Ticker + % TNA / Weight)."""
+    cols = [str(c).strip() for c in t.columns]
+    t.columns = cols
+    tcol = (next((c for c in cols if "holding" in c.lower() and "ticker" in c.lower()), None)
+            or next((c for c in cols if "ticker" in c.lower() and "fund" not in c.lower()), None))
+    wcol = next((c for c in cols if "tna" in c.lower() or "weight" in c.lower()), None)
+    if tcol is None or wcol is None:
+        return {}
+    w = {}
+    for tk, wt in zip(t[tcol], t[wcol]):
+        c = _clean([tk]) if pd.notna(tk) else []
+        try:
+            v = float(str(wt).replace("%", "").replace(",", "").strip())
+        except ValueError:
+            continue
+        if c and v > 0:
+            w[c[0]] = w.get(c[0], 0.0) + v
+    return w
+
+
+def export_weights():
+    """Backup: the newest QQQ holdings file saved from invesco.com's "Export data" button, in this folder
+    (any .csv / .xlsx / .xls with "holding" or "qqq" in its name). Returns ({ticker: weight}, label)."""
+    folder = Path(__file__).parent
+    files = [f for f in folder.iterdir() if f.suffix.lower() in (".csv", ".xlsx", ".xls")
+             and ("holding" in f.name.lower() or "qqq" in f.name.lower())]
+    if not files:
+        raise RuntimeError("no exported holdings file in the dashboard folder")
+    f = max(files, key=lambda x: x.stat().st_mtime)
+    tables = []
+    if f.suffix.lower() == ".csv":
+        raw = f.read_text(errors="ignore").splitlines()
+        start = next((i for i, line in enumerate(raw) if "ticker" in line.lower()), 0)   # skip title rows
+        tables.append(pd.read_csv(io.StringIO("\n".join(raw[start:]))))
+    else:
+        for skip in range(0, 8):                                                   # header row may be lower
+            try:
+                tables.append(pd.read_excel(f, skiprows=skip))
+            except Exception:  # noqa: BLE001
+                break
+    for t in tables:
+        w = _parse_weights_table(t)
+        if len(w) >= CFG["min_n"]:
+            age = (dt.datetime.now() - dt.datetime.fromtimestamp(f.stat().st_mtime)).days
+            return w, f"{f.name}, saved {age} day{'s' if age != 1 else ''} ago"
+    raise RuntimeError(f"could not read tickers / % TNA from {f.name}")
+
+
+def top_by_size(tickers, sizes, what="market cap"):
+    """The index_top largest members by size (QQQ fund weight, else market cap), after the EXCLUDE list
+    (GOOG -> Alphabet counts once)."""
+    n = CFG.get("index_top") or 0
+    excl = {x.upper() for x in CFG.get("exclude", [])}
+    pool = [t for t in tickers if t not in excl]
+    if not n:
+        return pool, ""
+    have = [t for t in pool if sizes.get(t)]
+    if len(have) < n:
+        return pool, f"{what} missing for most members - using all {len(pool)} instead of the top {n}."
+    ranked = sorted(have, key=lambda t: sizes[t], reverse=True)
+    return ranked[:n], ""
 
 
 # ───────────────────────── prices ─────────────────────────
@@ -376,6 +506,11 @@ def signals(close, p, members, hourly=None):
     trips.sort()
     out_now = bool(trips) and not preview
 
+    # per-stock stop (Nasdaq top-30 algo): a holding is sold on the first HOURLY close below its 200-day SMA
+    stop_hits = {}
+    if use_hourly and CFG.get("stop") == "hourly":
+        stop_hits = hourly_stops(comp, hourly, members, p, since)
+
     # vol target -> portfolio size
     basket_vol, size, vols = None, 1.0, {}
     vl = lens(p["vol_lookbacks"])
@@ -393,9 +528,32 @@ def signals(close, p, members, hourly=None):
     return dict(df=df, top=top, keep=top, teo_cash=[], teo_out=teo_out, teo=teo, n=n, n_q=n_q, share=share,
                 not_ready=not_ready, risk_off=n > 0 and share <= p["breadth_min"],
                 trips=trips, out_now=out_now, preview=preview, since=since, use_hourly=use_hourly,
+                stop_hits=stop_hits,
                 last_hour=hourly.index[-1] if use_hourly else None,
                 q_px=q_px, q_sma=q_sma, basket_vol=basket_vol, vols=vols, size=size,
                 partial=partial, bar_date=comp.index[-1].date(), comp=comp, live=live)
+
+
+def hourly_stops(comp, hourly, members, p, since):
+    """First hourly close since the last rebalance below the stock's 200-day SMA (as of the previous day)."""
+    names = [t for t in members if t in comp.columns and t in hourly.columns]
+    slow_d = comp[names].rolling(p["slow"]).mean()
+    hits = {}
+    for ts, row in hourly.iterrows():
+        d = ts.date()
+        if d < since:
+            continue
+        base = comp.index[comp.index.date < d]
+        if not len(base):
+            continue
+        sma = slow_d.loc[base[-1]]
+        for t in names:
+            if t in hits:
+                continue
+            px = row.get(t)
+            if pd.notna(px) and pd.notna(sma.get(t)) and px < sma[t]:
+                hits[t] = (ts, float(px), float(sma[t]))
+    return hits
 
 
 def hourly_trips(comp, hourly, members, p, since):
@@ -481,7 +639,13 @@ def build_orders(sig, p, holdings):
         for h in holdings:
             rows.append(dict(Ticker=h, Action="SELL", Why="Breadth filter: risk-off, hold nothing"))
         return rows, 0.0
+    stopped = {} if sig["preview"] else {h: v for h, v in sig.get("stop_hits", {}).items() if h in holdings}
+    for h, (ts, spx, ssma) in stopped.items():
+        rows.append(dict(Ticker=h, Action="SELL", Why=f"STOP: hourly close {spx:.2f} below 200-day SMA {ssma:.2f} "
+                                                      f"at {ts:%a %H:%M} - cash until Monday"))
     for i, t in enumerate(sig["top"], 1):
+        if t in stopped:
+            continue
         px = df.loc[t, "Price"]
         if t in sig["teo_cash"]:
             teo, stg = df.loc[t, "TEO"], df.loc[t, "TEO stage"]
@@ -495,16 +659,45 @@ def build_orders(sig, p, holdings):
                          **{"Target $": round(per_name, 0), "Shares": shares,
                             "Margin $": round(per_name / max(p["leverage"], 1.0), 0)}))
     for h in holdings:
-        if h in sig["top"]:
+        if h in sig["top"] or h in stopped:
             continue
         why = "Not in top " + str(p["top"])
         if h not in df.index:
-            why = f"No longer a {CFG['name']} member / no data"
+            if CFG.get("index_top") and h in (STATE.get("members") or {}).get("tickers", []):
+                why = f"Not in the top {CFG['index_top']} by size"
+            else:
+                why = f"No longer a {CFG['name']} member / no data"
         rows.append(dict(Ticker=h, Action="SELL", Why=why))
     return rows, per_name
 
 
 # ───────────────────────── app ─────────────────────────
+def load_weights():
+    """Pull QQQ fund weights from Invesco again. If Invesco fails: the exported holdings file, then the last
+    Invesco weights from this session (marked stale), then Yahoo market caps."""
+    prev, prev_asof = STATE.get("weights_invesco") or {}, STATE.get("weights_invesco_asof", "")
+    STATE["weights"], STATE["weights_asof"], STATE["caps"], STATE["size_err"] = {}, "", {}, ""
+    STATE["weights_time"] = dt.datetime.now()
+    try:
+        STATE["weights"], STATE["weights_asof"] = fund_weights()
+        STATE["weights_invesco"], STATE["weights_invesco_asof"] = STATE["weights"], STATE["weights_asof"]
+        STATE["weights_pulled"] = STATE["weights_time"]
+        return
+    except Exception as e:  # noqa: BLE001
+        STATE["size_err"] = str(e)
+    try:                                                                    # backup 1: exported file
+        STATE["weights"], label = export_weights()
+        STATE["weights_asof"] = f"from {label}"
+        return
+    except Exception as e2:  # noqa: BLE001
+        STATE["size_err"] += f" | export file: {e2}"
+    if prev:                                                                # backup 2: last good pull
+        STATE["weights"] = prev
+        STATE["weights_asof"] = (f"{prev_asof}, pulled {STATE['weights_pulled']:%H:%M} - latest refresh failed")
+        return
+    STATE["caps"] = market_caps(STATE["members"]["tickers"])               # backup 3: Yahoo market caps
+
+
 STATE = {"members": None, "members_choice": None, "members_time": None, "close": None, "hourly": None}
 
 
@@ -567,8 +760,8 @@ app.layout = html.Div(style={"background": BG, "minHeight": "100vh", "padding": 
                     "background": CARD, "border": f"1px solid {BORDER}", "borderRadius": "10px",
                     "padding": "12px", "marginBottom": "14px"}, children=[
         field("Members from", dd("source", "auto", [
-            {"label": "CNBC (auto backup)", "value": "auto"}, {"label": "CNBC only", "value": "cnbc"},
-            {"label": "Wikipedia", "value": "wikipedia"}], "170px")),
+            {"label": "CNBC (saved list backup)", "value": "auto"},
+            {"label": "CNBC only", "value": "cnbc"}], "190px")),
         field("Account $", num("equity", DEFAULTS["equity"], 100)),
         field("Leverage", num("leverage", DEFAULTS["leverage"], 0.1)),
         field("Vol target", num("vol_target", DEFAULTS["vol_target"], 0.01)),
@@ -650,7 +843,7 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
                  vol_lookbacks=vol_lookbacks or "21,63", vol_min_size=float(vol_min_size or 0),
                  top=max(int(top or 10), 1), breadth_min=float(breadth_min or 0), momentum=momentum or DEFAULTS["momentum"],
                  mom_method=mom_method, mom_positive=mom_positive, fast=int(fast or 10), slow=int(slow or 200),
-                 market_sma=int(market_sma or 200), teo_filter=teo_filter or "on",
+                 market_sma=int(market_sma or 200), teo_filter=teo_filter or DEFAULTS["teo_filter"],
                  teo_len=int(teo_len or 21), teo_smooth=int(teo_smooth or 1), teo_slope=max(int(teo_slope or 6), 1),
                  teo_flat=float(teo_flat or 0), teo_deep=float(teo_deep if teo_deep is not None else 0.5),
                  teo_active=float(teo_active if teo_active is not None else 0.25),
@@ -667,27 +860,39 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
             STATE["members_choice"] = source
             STATE["members_time"] = dt.datetime.now()
             STATE["close"] = None
+        if CFG.get("index_top") and (reprice or not STATE.get("weights_time") or STATE["close"] is None):
+            load_weights()                              # fresh Invesco weights on every load, hourly tick and Refresh
         mem = STATE["members"]
-        if STATE["close"] is None or reprice:
-            STATE["close"] = load_prices(mem["tickers"])
+        if STATE.get("weights"):
+            members, size_note = top_by_size(mem["tickers"], STATE["weights"], "QQQ fund weight")
+            pulled = (f", pulled {STATE['weights_pulled']:%H:%M}"
+                      if STATE.get("weights_pulled") == STATE.get("weights_time") else "")
+            size_by = f"QQQ fund weight (Invesco{', ' + STATE['weights_asof'] if STATE.get('weights_asof') else ''}{pulled})"
+        else:
+            members, size_note = top_by_size(mem["tickers"], STATE.get("caps") or {}, "market cap")
+            size_by = "market cap (Yahoo - Invesco weights unavailable)"
+        if STATE["close"] is None or reprice or STATE.get("priced") != sorted(members):
+            STATE["close"] = load_prices(members)
+            STATE["priced"] = sorted(members)
             STATE["hourly"] = None
         close = STATE["close"]
         hourly, hourly_err = None, ""
         if p["checks"] == "hourly":
             if STATE.get("hourly") is None or reprice:
                 try:
-                    STATE["hourly"] = load_hourly(mem["tickers"])
+                    STATE["hourly"] = load_hourly(members)
                 except Exception as e:  # noqa: BLE001
                     STATE["hourly"], hourly_err = None, str(e)
             hourly = STATE.get("hourly")
 
-        sig = signals(close, p, mem["tickers"], hourly)
+        sig = signals(close, p, members, hourly)
         held = _clean((holdings or "").replace(";", ",").replace(" ", ",").split(","))
         orders, per_name = build_orders(sig, p, held)
 
         # ── header + cards
-        missing = [t for t in mem["tickers"] if t not in close.columns]
-        src_txt = (f"{len(mem['tickers'])} members from {mem['source']}"
+        missing = [t for t in members if t not in close.columns]
+        top_txt = (f"top {len(members)} by {size_by} of " if CFG.get("index_top") and not size_note else "")
+        src_txt = (f"{top_txt}{len(mem['tickers'])} members from {mem['source']}"
                    f"{' (as of ' + mem['asof'] + ')' if mem.get('asof') else ''}")
         from_cnbc = str(mem["source"]).startswith("CNBC")
         sub = [html.Span(src_txt if from_cnbc else f"⚠ NOT from CNBC - {src_txt}",
@@ -759,7 +964,7 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
             g_corr = fig_layout(go.Figure(), "Picks: correlation (needs 2+ picks)", 380)
 
         # ── breadth history
-        bh = breadth_history(sig["comp"], mem["tickers"], p)
+        bh = breadth_history(sig["comp"], members, p)
         g_b = go.Figure(go.Scatter(x=bh.index, y=bh * 100, mode="lines", line=dict(color=ACCENT), name="Breadth"))
         g_b.add_hline(y=p["breadth_min"] * 100, line=dict(color=BAD, dash="dash"),
                       annotation_text=f"risk-off at {p['breadth_min']:.0%}", annotation_font_color=BAD)
@@ -804,12 +1009,18 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
             if c in show:
                 show[c] = show[c].map({True: "yes", False: "no"}).fillna("")
         show["Pick"] = show["Ticker"].map(lambda t: "★" if t in top else ("TEO out" if t in sig["teo_out"] else ""))
+        caps = STATE.get("caps") or {}
+        if caps:
+            show["Mkt cap $B"] = show["Ticker"].map(lambda t: round(caps[t] / 1e9, 1) if caps.get(t) else None)
+        fw = STATE.get("weights") or {}
+        if fw:
+            show["QQQ wt %"] = show["Ticker"].map(lambda t: round(fw[t], 2) if fw.get(t) is not None else None)
         w = mem.get("weights") or {}
         if any(v is not None for v in w.values()):
             show["Index wt %"] = show["Ticker"].map(lambda t: w.get(t))
         order_cols = [c for c in ["Pick", "Rank", "Ticker", "Price", "Qualifies", "Score"] + mcols +
                       ["TEO", "TEO slope", "TEO stage", "SMA fast", "SMA slow", "Vs 200d %",
-                       "Index wt %", "Ready"] if c in show]
+                       "QQQ wt %", "Mkt cap $B", "Index wt %", "Ready"] if c in show]
         show = show[order_cols].sort_values(["Rank", "Ticker"], na_position="last")
         all_tbl = dash_table.DataTable(
             data=show.to_dict("records"), columns=[{"name": c, "id": c} for c in order_cols],
@@ -826,6 +1037,13 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
             ])
 
         notes = []
+        if size_note:
+            notes.append(size_note)
+        if CFG.get("index_top") and STATE.get("size_err"):
+            notes.append(f"Invesco feed could not be read ({STATE['size_err'][:300]})"
+                         + (" - using the exported holdings file." if STATE.get("weights") else
+                            " - ranked by Yahoo market cap. Backup: save the holdings from invesco.com's QQQ page "
+                            "(Portfolio -> Export data) into the dashboard folder."))
         if p["checks"] == "hourly" and not sig["use_hourly"]:
             notes.append(f"Hourly prices could not be loaded ({hourly_err or 'no data'}) - showing at-the-close checks.")
         if mem.get("notes"):

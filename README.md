@@ -5,7 +5,7 @@ this week's picks, the market filters and the orders to place.
 
 | Dashboard | Run | Opens at | Market filter | Vol target |
 |---|---|---|---|---|
-| Nasdaq-100 | `python nasdaq_dashboard.py` (or `run_nasdaq.bat`) | http://127.0.0.1:8050 | QQQ, checked hourly | 35% |
+| Nasdaq-100 (top 30) | `python nasdaq_dashboard.py` (or `run_nasdaq.bat`) | http://127.0.0.1:8050 | QQQ, checked hourly | 35% |
 | Dow 30 | `python dow_dashboard.py` (or `run_dow.bat`) | http://127.0.0.1:8051 | DIA, checked at the close | off |
 
 Both can run at the same time.
@@ -30,26 +30,45 @@ pip install -r requirements.txt
 ## Where the stocks come from
 
 Members are read from CNBC's index pages (www.cnbc.com/nasdaq-100 and /dow-30). If CNBC can't be read, the
-dashboard falls back to Wikipedia's member table, then to the last list it saved (`ndx_constituents_cache.json` /
+dashboard falls back to the last list it saved (`ndx_constituents_cache.json` /
 `dow_constituents_cache.json`, created next to the scripts). When the list is not from CNBC, the header says
-**"NOT from CNBC"** in red. The "Members from" dropdown can force CNBC only or Wikipedia.
+**"NOT from CNBC"** in red. The "Members from" dropdown can force CNBC only (no saved-list backup).
+
+Nasdaq only: the members are ranked by **QQQ fund weight** to pick the top 30, in this order:
+
+1. Invesco's public QQQ holdings feed (the one behind invesco.com's QQQ page, looked up by CUSIP 46090E103).
+2. **Backup:** a holdings file you saved from invesco.com's QQQ page (Portfolio -> **Export data**) into the dashboard
+   folder. Any .csv / .xlsx with "holding" or "qqq" in its name; the newest one is used, and the header shows how
+   old it is. Re-export it every week or so.
+3. The last Invesco weights pulled in this session, if a later refresh fails (marked "latest refresh failed").
+4. Last resort: Yahoo market cap. It ranks big foreign ADRs (ASML, ARM) too high, because fund weights count only
+   US-listed / free-float shares, so treat the top 30 as approximate when this is used.
+
+Invesco is pulled fresh every time the dashboard starts, on every hourly auto refresh and on **Refresh data**;
+nothing is saved between runs. If the new weights change the top 30, prices are reloaded for the new names.
+The header says which one was used (and the time of the last successful pull), and the notes at the bottom give the reason if the feed failed. The members
+table shows "QQQ wt %" (or "Mkt cap $B" in the last-resort case).
 
 Prices come from Yahoo Finance via yfinance (3 years of dividend-adjusted daily bars).
 
-## Rules (same as the QQQ and Dow algos)
+## Rules (each dashboard mirrors its own QuantConnect algo)
 
-1. **Qualify:** 10-day SMA above 200-day SMA, price above 200-day SMA, blended momentum positive (Nasdaq: 21 + 126 days; Dow: 21 + 63 + 126 days).
-2. **TEO filter:** qualifying stocks whose Trend Efficiency Oscillator stage is **Exhausting** are removed before
-   ranking. TEO = signed Kaufman efficiency ratio (21 days), EMA-smoothed (7); stage from the 6-day slope with fixed
-   zones 0.50 / 0.25 / 0.10 and flat threshold 0.02.
-3. **Ranking:** average rank on each momentum return; the top 10 are the picks.
-4. **Breadth:** share of ALL members that qualify (rule 1). At or below the minimum (Nasdaq 30%, Dow 40%) = risk-off, hold nothing.
-5. **Index SMA:** a fresh close of QQQ / DIA below its 200-day SMA also goes to cash.
-6. **When filters are checked:** Nasdaq every hour, Dow at every daily close (see below). A trip means cash until
-   the next Monday rebalance, which resumes if breadth is above the minimum.
-7. **Sizing:** leverage 2.5, each pick gets size x 2.5 / 10 of the account. Nasdaq: size = 35% / (2.5 x basket vol),
-   capped at 100% (basket vol = higher of the 21 and 63-day realized vol of the 10 picks). Dow: always 100%.
-8. **No per-stock stop:** holdings change only at the Monday rebalance or when a market filter trips.
+Shared:
+
+1. **Qualify:** 10-day SMA above 200-day SMA, price above 200-day SMA, blended 21/63/126-day momentum positive.
+2. **Ranking:** average rank on each momentum return; the top 10 are the picks.
+3. **Breadth:** share of the members that qualify. At or below 40% = risk-off, hold nothing.
+4. **Index SMA:** a fresh close of QQQ / DIA below its 200-day SMA also goes to cash.
+5. **After a trip:** cash until the next Monday rebalance, which resumes if breadth is above 40%.
+
+| | Nasdaq (QQQ top-30 algo) | Dow (Dow 30 algo) |
+|---|---|---|
+| Universe | Top 30 Nasdaq-100 members by QQQ fund weight (Invesco holdings; Yahoo market cap as backup); GOOG dropped so Alphabet counts once; breadth on these 30 | All 30 members |
+| TEO filter | Off | On (Exhausting removed before ranking) |
+| Leverage | 2.0 | 2.5 |
+| Vol target | 35%: size = 0.35 / (2.0 x basket vol), capped at 100% | Off (always 100%) |
+| Per-stock stop | Sold on the first hourly close below its 200-day SMA; cash until Monday | None |
+| Checks | Hourly | At the close |
 
 **When the market filters are checked** (the "Market checks" control can switch either dashboard):
 
@@ -68,16 +87,20 @@ SMAs, momentum, TEO and basket vol always use completed daily bars.
 - **Cards:** regime (risk-on / risk-off / cash until Monday), since last rebalance (any filter trips this week),
   breadth, index vs its 200-day SMA, basket vol, portfolio size, gross exposure, expected account vol, TEO removed.
 - **This week's orders:** type your current holdings (comma separated) and set your account size; it lists BUY,
-  HOLD / RESIZE and SELL with target dollars, shares and margin per stock.
+  HOLD / RESIZE and SELL with target dollars, shares and margin per stock. On the Nasdaq dashboard a holding that hit
+  the hourly 200-day stop since Monday shows as SELL with the time it happened.
 - **Charts:** 63-day correlation of the picks, breadth over the last year, the index vs its SMA, momentum of the top
   candidates.
-- **All members table:** sortable and filterable, with qualify, rank, momentum, SMAs, TEO value, slope and stage.
+- **All members table:** sortable and filterable, with qualify, rank, momentum, SMAs, TEO value, slope and stage,
+  and market cap (Nasdaq).
   Picks are starred; stocks removed by TEO are marked "TEO out".
-- **Controls:** every algo parameter can be changed at the top of the page. **Refresh data** reloads prices and
-  the member list.
+- **Controls:** every algo parameter can be changed at the top of the page. **Refresh data** reloads prices,
+  the member list and (Nasdaq) the Invesco weights.
 
 ## Known differences from the algos
 
+- Nasdaq: the top 30 uses Invesco's latest QQQ weights; the algo re-ranks once a month, so a name near 30th can
+  differ mid-month. If Invesco can't be read, the dashboard uses the backups above and says so at the bottom.
 - Breadth here divides by all members; the algo divides by members with enough history (they differ only for
   recent IPOs).
 - The algo's Monday rebalance uses the 9:45 AM price for "price above the 200-day SMA"; the dashboard uses the last
