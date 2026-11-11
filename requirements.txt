@@ -1,21 +1,7 @@
-# Dow 30 live signals dashboard (dow30_signals_dash.py) - see README.md
-# Python 3.14: the numpy / pandas / lxml minimums below are versions with ready-made 3.14 installers
-# Install:  pip install -r requirements.txt
-# Run:      python dow30_signals_dash.py   then open http://127.0.0.1:8050
-
-dash>=2.16
+dash>=2.14
 plotly>=5.18
-pandas>=2.3.3
-numpy>=2.3.3
-yfinance>=0.2.54
+pandas>=2.0
+numpy>=1.24
+yfinance>=0.2.40
 requests>=2.31
-
-# pandas.read_excel for the SPDR DIA holdings .xlsx
-openpyxl>=3.1
-# pandas.read_html for the Wikipedia fallback
-lxml>=6.0.2
-
-# Time zones: Windows has no built-in time zone database, so zoneinfo needs tzdata
-tzdata>=2024.1; sys_platform == "win32"
-# Only for Python 3.8 or older
-backports.zoneinfo>=0.2.1; python_version < "3.9"
+lxml>=4.9

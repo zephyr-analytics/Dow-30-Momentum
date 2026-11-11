@@ -1,135 +1,84 @@
-# Dow 30 Momentum + Trend — Live Signals Dashboard
+# Momentum + Trend live signals dashboards (Nasdaq-100 and Dow 30)
 
-A local Plotly Dash page that shows, in real time, what the QuantConnect algorithm `dow30_momentum_trend.py` would hold, buy, sell or stop out of. It uses free Yahoo Finance data, so it needs no API keys.
+Two Plotly Dash dashboards that apply the QuantConnect momentum + trend algos to today's market, so you can see
+this week's picks, the market filters and the orders to place.
 
----
+| Dashboard | Run | Opens at | Market filter | Vol target |
+|---|---|---|---|---|
+| Nasdaq-100 | `python nasdaq_dashboard.py` (or `run_nasdaq.bat`) | http://127.0.0.1:8050 | QQQ | 35% |
+| Dow 30 | `python dow_dashboard.py` (or `run_dow.bat`) | http://127.0.0.1:8051 | DIA | off |
+
+Both can run at the same time.
+
+## Files
+
+- `momentum_dashboard.py` - the shared engine: member lists, signals, orders, layout. All logic lives here.
+- `nasdaq_dashboard.py`, `dow_dashboard.py` - launchers that pick the index and port.
+- `run_nasdaq.bat`, `run_dow.bat` - Windows double-click launchers.
+- `requirements.txt` - Python packages.
+
+Keep all files in the same folder.
 
 ## Setup
 
-Requires Python 3.9 or newer; tested against the package versions for Python 3.14.
-
-1. Put these files in one folder:
-   - `dow30_signals_dash.py`
-   - `requirements.txt`
-   - `README.md`
-2. Open a terminal in that folder. Optionally, create a virtual environment first:
-
-   ```
-   python -m venv .venv
-   .venv\Scripts\activate          # Windows
-   source .venv/bin/activate       # macOS / Linux
-   ```
-
-3. Install the packages:
-
-   ```
-   python -m pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-
-## Run
+Python 3.10 or newer.
 
 ```
-python dow30_signals_dash.py
+pip install -r requirements.txt
 ```
 
-Then open **http://127.0.0.1:8050** in a browser. Stop the dashboard with `Ctrl + C` in the terminal.
+## Where the stocks come from
 
-The first load takes 10–30 seconds while it downloads two years of daily prices and five days of 30-minute prices for the Dow 30 and DIA.
+Members are read from CNBC's index pages (www.cnbc.com/nasdaq-100 and /dow-30). If CNBC can't be read, the
+dashboard falls back to Wikipedia's member table, then to the last list it saved (`ndx_constituents_cache.json` /
+`dow_constituents_cache.json`, created next to the scripts). When the list is not from CNBC, the header says
+**"NOT from CNBC"** in red. The "Members from" dropdown can force CNBC only or Wikipedia.
 
----
+Prices come from Yahoo Finance via yfinance (3 years of dividend-adjusted daily bars).
 
-## The strategy it follows
+## Rules (same as the latest QQQ algo; Dow identical except DIA and no vol target)
 
-| Rule | Setting |
-|---|---|
-| **Trend** | 10-day SMA above the 200-day SMA **and** price above the 200-day SMA |
-| **Momentum** | 21 / 63 / 126-day returns, ranked separately and the ranks averaged; the average return must be positive |
-| **Holdings** | Top 10 qualifying stocks, equal weight. Each slot = leverage ÷ 10 of equity; empty slots stay in cash |
-| **Leverage** | 2.5x by default (25% of equity per stock) |
-| **Rebalance** | Weekly, **Monday 9:45 AM ET**, 15 minutes after the open (Tuesday if Monday is a holiday) |
-| **Stop** | An hourly candle closing below the stock's 200-day SMA → sell it; it stays out until the next rebalance |
-| **Market filter** | Sell **everything** if, on any hourly candle, **40% or fewer** of the Dow stocks qualify **or** DIA crosses below its 200-day SMA. Restart at the next rebalance once more than 40% qualify, even if DIA is still below its SMA |
-| **Kalshi costs** | 0.02% fee per side; daily funding on positions; interest of 7% on margin backing positions at 1.5x+ and 3.5% on idle cash |
+1. **Qualify:** 10-day SMA above 200-day SMA, price above 200-day SMA, blended 21/63/126-day momentum positive.
+2. **TEO filter:** qualifying stocks whose Trend Efficiency Oscillator stage is **Exhausting** are removed before
+   ranking. TEO = signed Kaufman efficiency ratio (21 days), EMA-smoothed (7); stage from the 6-day slope with fixed
+   zones 0.50 / 0.25 / 0.10 and flat threshold 0.02.
+3. **Ranking:** average rank on 21, 63 and 126-day returns; the top 10 are the picks.
+4. **Breadth:** share of ALL members that qualify (rule 1). At or below 40% = risk-off, hold nothing.
+5. **Index SMA:** a fresh close of QQQ / DIA below its 200-day SMA also goes to cash.
+6. **When filters are checked:** breadth and the index SMA are checked at every daily close. A trip means cash until
+   the next Monday rebalance, which resumes if breadth is above 40%.
+7. **Sizing:** leverage 2.5, each pick gets size x 2.5 / 10 of the account. Nasdaq: size = 35% / (2.5 x basket vol),
+   capped at 100% (basket vol = higher of the 21 and 63-day realized vol of the 10 picks). Dow: always 100%.
+8. **No per-stock stop:** holdings change only at the Monday rebalance or when a market filter trips.
 
-The daily SMAs and momentum use **completed** daily bars, like QuantConnect. Price is the latest intraday price. Hourly candles end on the hour (10:00 … 16:00 ET), also like QuantConnect.
+**All checks are at the close.** Everything uses completed daily bars. While the market is open, today's partial bar
+is ignored, so signals only change after 4:00 PM ET.
 
----
+## What's on the page
 
-## Using the page
+- **Cards:** regime (risk-on / risk-off / cash until Monday), since last rebalance (any filter trips this week),
+  breadth, index vs its 200-day SMA, basket vol, portfolio size, gross exposure, expected account vol, TEO removed.
+- **This week's orders:** type your current holdings (comma separated) and set your account size; it lists BUY,
+  HOLD / RESIZE and SELL with target dollars, shares and margin per stock.
+- **Charts:** 63-day correlation of the picks, breadth over the last year, the index vs its SMA, momentum of the top
+  candidates.
+- **All members table:** sortable and filterable, with qualify, rank, momentum, SMAs, TEO value, slope and stage.
+  Picks are starred; stocks removed by TEO are marked "TEO out".
+- **Controls:** every algo parameter can be changed at the top of the page. **Refresh data** reloads prices and
+  the member list.
 
-### Inputs (top row)
-The page remembers these between visits.
+## Known differences from the algos
 
-| Input | What it does |
-|---|---|
-| **Account equity ($)** | Your account size; used for dollar and share targets |
-| **Leverage** | Total leverage across all holdings |
-| **Top N** | How many stocks to hold (default 10) |
-| **Kalshi funding (% per year)** | Enter the current funding rate from Kalshi's market page; positive = longs pay |
-| **Current holdings** | Tickers you hold now, comma-separated (e.g. `NVDA, GS, CAT`); turns on stop alerts and the order list |
-| **Refresh prices now** | Forces a new download; prices otherwise refresh every 5 minutes |
+- Breadth here divides by all members; the algo divides by members with enough history (they differ only for
+  recent IPOs).
+- The algo's Monday rebalance uses the 9:45 AM price for "price above the 200-day SMA"; the dashboard uses the last
+  close.
+- The breadth history chart uses today's member list for the whole year.
+- Market holidays are not skipped when working out "since last rebalance".
 
-### Sections
+## If CNBC fails
 
-**Cards**
-- **Market filter:** ON, STOPPED or RISK OFF, with the current breadth and DIA versus its 200 SMA.
-- **Next rebalance:** a countdown, and whether Monday will buy or stay in cash.
-- **Qualifying stocks / Target exposure:** how many stocks pass and the total position size.
-- **Kalshi carry:** estimated yearly interest minus funding, plus fees per round trip.
-
-**Alerts:** the market filter tripping, and for each of your holdings either **STOPPED** (an hourly close below its 200 SMA since the last rebalance; stay out until Monday) or **OK**.
-
-**Orders at the next rebalance:** BUY, BUY (re-enter), HOLD / resize or SELL for each stock, with dollar and share targets.
-
-**Target portfolio:** the top-N stocks with rank, price, distance above the 200 SMA, momentum, weight, dollars and shares.
-
-**Chart:** daily close with the 10 and 200 SMAs for any Dow stock or DIA.
-
-**All Dow 30 stocks:** every stock's status, or the reason it doesn't qualify.
-
----
-
-## Settings in the code
-
-Edit the block at the top of `dow30_signals_dash.py` to keep it in line with your QuantConnect parameters:
-
-```python
-FAST, SLOW = 10, 200
-MOM_LENS = (21, 63, 126)
-MOM_METHOD = "rank"            # "rank" or "return"
-MOM_POSITIVE = "blend"         # "blend", "all" or "off"
-TOP_N = 10
-DEFAULT_LEVERAGE = 2.5
-MARKET_FILTER = "both"         # "both", "breadth", "sma" or "off"
-BREADTH_MIN = 0.40
-REBAL_WEEKDAY = 0              # 0 = Monday
-REBAL_MINUTES_AFTER_OPEN = 15
-DATA_REFRESH_SEC = 300
-RISK_FREE = 0.04               # starting value for the funding box
-PROMO_POS_APY, PROMO_CASH_APY, PROMO_MIN_LEV = 0.07, 0.035, 1.5
-KALSHI_FEE = 0.0002
-```
-
-**Dow 30 tickers** are pulled from the SPDR DIA daily holdings file. If that fails, they come from Wikipedia, then from a built-in list. The subtitle shows which source was used.
-
----
-
-## Notes and limits
-
-- **Data delay.** Yahoo's free intraday data can lag by a few minutes, so check the price before placing orders.
-- **Signals only.** The dashboard places no trades.
-- **Stop replay.** Stops and market-filter trips are rebuilt from the last 5 days of hourly candles since the last rebalance. If the dashboard was off, it still catches any stop from earlier in the week.
-- **Carry is an estimate.** Kalshi's funding is set by the market, and the 7% interest is a promotion with capacity caps that can change at any time.
-- **Dashboard vs. backtest.** The dashboard uses today's Dow list; the backtest uses the point-in-time DIA holdings.
-
-## Troubleshooting
-
-| Problem | Fix |
-|---|---|
-| `pip` tries to build numpy / pandas / lxml from source | Run `python -m pip install --upgrade pip`, then install again |
-| `ZoneInfoNotFoundError` on Windows | `pip install tzdata` |
-| "Price download failed" or empty tables | Yahoo is rate-limiting or changed something: wait a minute and press Refresh, or run `pip install -U yfinance` |
-| Tickers show "built-in list" | The SPDR and Wikipedia downloads both failed; the built-in list is the Dow as of June 29, 2026 |
-| Leverage or Top N shows an old value | The page remembers inputs; retype the value |
-| Port 8050 already in use | Close the other dashboard, or change `port=8050` at the bottom of the file |
+CNBC may load its member list with JavaScript, which a plain download can't see. If the header shows the red
+"NOT from CNBC" warning, open the CNBC index page in Chrome, press F12, go to Network -> Fetch/XHR, reload, and look
+for the request that returns the member list. That request can be wired into `from_cnbc()` in
+`momentum_dashboard.py`.
