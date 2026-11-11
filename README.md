@@ -5,8 +5,8 @@ this week's picks, the market filters and the orders to place.
 
 | Dashboard | Run | Opens at | Market filter | Vol target |
 |---|---|---|---|---|
-| Nasdaq-100 | `python nasdaq_dashboard.py` (or `run_nasdaq.bat`) | http://127.0.0.1:8050 | QQQ | 35% |
-| Dow 30 | `python dow_dashboard.py` (or `run_dow.bat`) | http://127.0.0.1:8051 | DIA | off |
+| Nasdaq-100 | `python nasdaq_dashboard.py` (or `run_nasdaq.bat`) | http://127.0.0.1:8050 | QQQ, checked hourly | 35% |
+| Dow 30 | `python dow_dashboard.py` (or `run_dow.bat`) | http://127.0.0.1:8051 | DIA, checked at the close | off |
 
 Both can run at the same time.
 
@@ -45,14 +45,23 @@ Prices come from Yahoo Finance via yfinance (3 years of dividend-adjusted daily 
 3. **Ranking:** average rank on 21, 63 and 126-day returns; the top 10 are the picks.
 4. **Breadth:** share of ALL members that qualify (rule 1). At or below 40% = risk-off, hold nothing.
 5. **Index SMA:** a fresh close of QQQ / DIA below its 200-day SMA also goes to cash.
-6. **When filters are checked:** breadth and the index SMA are checked at every daily close. A trip means cash until
+6. **When filters are checked:** Nasdaq every hour, Dow at every daily close (see below). A trip means cash until
    the next Monday rebalance, which resumes if breadth is above 40%.
 7. **Sizing:** leverage 2.5, each pick gets size x 2.5 / 10 of the account. Nasdaq: size = 35% / (2.5 x basket vol),
    capped at 100% (basket vol = higher of the 21 and 63-day realized vol of the 10 picks). Dow: always 100%.
 8. **No per-stock stop:** holdings change only at the Monday rebalance or when a market filter trips.
 
-**All checks are at the close.** Everything uses completed daily bars. While the market is open, today's partial bar
-is ignored, so signals only change after 4:00 PM ET.
+**When the market filters are checked** (the "Market checks" control can switch either dashboard):
+
+- **Nasdaq: hourly**, like the QQQ algo with `filter_check=hourly`. Every completed hourly bar since Monday's
+  rebalance is checked: breadth uses each stock's hourly close against its daily SMAs and momentum from the previous
+  day, and QQQ's hourly close is checked for a fresh cross below its daily 200-day SMA. Prices shown are the last
+  completed hourly close. The page refreshes itself every hour. If hourly prices can't be loaded, it falls back to
+  at-the-close checks and says so at the bottom.
+- **Dow: at the close.** Everything uses completed daily bars. While the market is open, today's partial bar is
+  ignored, so signals only change after 4:00 PM ET.
+
+SMAs, momentum, TEO and basket vol always use completed daily bars.
 
 ## What's on the page
 
@@ -72,7 +81,10 @@ is ignored, so signals only change after 4:00 PM ET.
 - Breadth here divides by all members; the algo divides by members with enough history (they differ only for
   recent IPOs).
 - The algo's Monday rebalance uses the 9:45 AM price for "price above the 200-day SMA"; the dashboard uses the last
-  close.
+  completed hourly close (Nasdaq) or the last close (Dow).
+- Yahoo's hourly bars run 9:30-10:30, 10:30-11:30 ... 3:30-4:00; QuantConnect's run 9:30-10:00, 10:00-11:00 ...
+  So an intraday trip can be timed slightly differently.
+- For the QQQ backtest to match the Nasdaq dashboard, run it with `filter_check=hourly` (its default is `close`).
 - The breadth history chart uses today's member list for the whole year.
 - Market holidays are not skipped when working out "since last rebalance".
 

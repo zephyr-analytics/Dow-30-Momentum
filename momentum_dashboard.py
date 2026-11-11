@@ -23,9 +23,14 @@ Mirrors the latest QuantConnect algo (the QQQ version):
                  basket vol = realized vol of the top-10 basket (weights 1/10) over 21 and 63 days, the higher one.
   * Stop       : none per stock - holdings change only at the rebalance or when a market filter trips.
 
-All checks are AT THE CLOSE: SMAs, momentum, TEO, breadth, the index SMA check, basket vol and "price" all use
-COMPLETED daily bars. While the market is open, today's partial bar is ignored (yesterday's close is used), so the
-signals only change after 4:00 PM ET.
+WHEN THE MARKET FILTERS ARE CHECKED ("Market checks" control; default per index):
+  * Nasdaq: HOURLY - like the algo with filter_check=hourly. Every completed hourly bar since the last rebalance is
+    checked: breadth uses each stock's hourly close vs its daily SMAs / momentum as of the previous day, and QQQ's
+    hourly close is checked for a fresh cross below its daily 200-day SMA. "Price" is the last completed hourly close.
+    The page refreshes itself every hour (prices only; the Refresh button also reloads the member list).
+  * Dow: AT THE CLOSE - everything uses completed daily bars; while the market is open, today's partial bar is
+    ignored, so the signals only change after 4:00 PM ET.
+  SMAs, momentum, TEO and basket vol always use completed daily bars.
 
 Members come from CNBC's index page (www.cnbc.com/nasdaq-100 or /dow-30). If CNBC can't be read, the dashboard falls
 back to Wikipedia's member table, then to the last list it saved (a json file next to this script), and says so in
@@ -60,10 +65,10 @@ DEFAULTS = dict(
     equity=10_000,
 )
 INDEXES = {
-    "nasdaq": dict(name="Nasdaq-100", bench="QQQ", port=8050, min_n=90, max_n=110, vol_target=0.35,
+    "nasdaq": dict(name="Nasdaq-100", bench="QQQ", port=8050, min_n=90, max_n=110, checks="hourly", vol_target=0.35,
                    cnbc=["https://www.cnbc.com/nasdaq-100/", "https://www.cnbc.com/markets/nasdaq-100/"],
                    wiki="https://en.wikipedia.org/wiki/Nasdaq-100", cache="ndx_constituents_cache.json"),
-    "dow": dict(name="Dow 30", bench="DIA", port=8051, min_n=28, max_n=32, vol_target=0.0,          # Dow: no vol target
+    "dow": dict(name="Dow 30", bench="DIA", port=8051, min_n=28, max_n=32, checks="close", vol_target=0.0,          # Dow: no vol target
                 cnbc=["https://www.cnbc.com/dow-30/", "https://www.cnbc.com/markets/dow-30/"],
                 wiki="https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average", cache="dow_constituents_cache.json"),
 }
@@ -72,6 +77,7 @@ INDEX_KEY = _arg or os.environ.get("DASH_INDEX", "nasdaq").lower()
 CFG = INDEXES[INDEX_KEY]
 BENCH = CFG["bench"]
 CACHE_FILE = Path(__file__).with_name(CFG["cache"])
+DEFAULTS["checks"] = CFG["checks"]                  # Nasdaq: hourly, Dow: at the close
 DEFAULTS["vol_target"] = CFG["vol_target"]          # Nasdaq 35%, Dow off (always 100% deployed)
 ET = ZoneInfo("America/New_York")
 UA = {
@@ -198,6 +204,21 @@ def load_prices(tickers):
     return close
 
 
+def load_hourly(tickers):
+    """Completed hourly bars for the last ~8 days, indexed by bar END time (ET), like QuantConnect's hourly bars."""
+    yf_t = sorted(set(tickers) | {BENCH})
+    data = yf.download(yf_t, period="8d", interval="60m", auto_adjust=True, progress=False,
+                       group_by="column", threads=True, prepost=False)
+    h = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data[["Close"]]
+    h = h.dropna(how="all", axis=1).sort_index()
+    idx = pd.to_datetime(h.index)
+    idx = idx.tz_convert(ET) if idx.tz is not None else idx.tz_localize(ET)
+    ends = pd.DatetimeIndex([min(t + pd.Timedelta(minutes=60), t.replace(hour=16, minute=0)) for t in idx])
+    now = pd.Timestamp(dt.datetime.now(ET))
+    h.index = ends
+    return h[ends <= now]                                 # drop the hour still in progress
+
+
 def split_completed(close):
     """Completed daily bars and the latest CLOSE. All checks are at-the-close: while the market is open, today's
     partial bar is ignored and everything uses yesterday's close."""
@@ -245,8 +266,11 @@ def lens(text):
     return [int(x) for x in str(text).split(",") if str(x).strip()]
 
 
-def signals(close, p, members):
+def signals(close, p, members, hourly=None):
     comp, live, partial = split_completed(close)
+    use_hourly = p.get("checks") == "hourly" and hourly is not None and not hourly.empty
+    if use_hourly:
+        live = hourly.ffill().iloc[-1].reindex(comp.columns).fillna(live)    # latest completed hourly close
     mom_lens = lens(p["momentum"])
     names = [t for t in members if t in comp.columns]
     rows = []
@@ -331,16 +355,19 @@ def signals(close, p, members):
     since = monday - dt.timedelta(days=7) if before_reb else monday          # date of the last rebalance
     preview = now.weekday() >= 5 or before_reb                              # next thing to happen is a rebalance
     trips = []
-    bh = breadth_history(comp, members, p, days=10)
-    hit = bh[(bh.index.date >= since) & (bh <= p["breadth_min"])]
-    if len(hit):
-        trips.append((hit.index[0].date(), f"breadth {hit.iloc[0]:.0%} at the close"))
-    if len(q) > p["market_sma"]:
-        sma_s = q.rolling(p["market_sma"]).mean()
-        cross = (q.shift(1) >= sma_s.shift(1)) & (q < sma_s)
-        cx = cross[cross & (cross.index.date >= since)]
-        if len(cx):
-            trips.append((cx.index[0].date(), f"{BENCH} closed below its {p['market_sma']}-day SMA (fresh cross)"))
+    if use_hourly:
+        trips = hourly_trips(comp, hourly, members, p, since)
+    else:
+        bh = breadth_history(comp, members, p, days=10)
+        hit = bh[(bh.index.date >= since) & (bh <= p["breadth_min"])]
+        if len(hit):
+            trips.append((hit.index[0].date(), f"breadth {hit.iloc[0]:.0%} at the close"))
+        if len(q) > p["market_sma"]:
+            sma_s = q.rolling(p["market_sma"]).mean()
+            cross = (q.shift(1) >= sma_s.shift(1)) & (q < sma_s)
+            cx = cross[cross & (cross.index.date >= since)]
+            if len(cx):
+                trips.append((cx.index[0].date(), f"{BENCH} closed below its {p['market_sma']}-day SMA (fresh cross)"))
     trips.sort()
     out_now = bool(trips) and not preview
 
@@ -360,9 +387,55 @@ def signals(close, p, members):
 
     return dict(df=df, top=top, keep=top, teo_cash=[], teo_out=teo_out, teo=teo, n=n, n_q=n_q, share=share,
                 not_ready=not_ready, risk_off=n > 0 and share <= p["breadth_min"],
-                trips=trips, out_now=out_now, preview=preview, since=since,
+                trips=trips, out_now=out_now, preview=preview, since=since, use_hourly=use_hourly,
+                last_hour=hourly.index[-1] if use_hourly else None,
                 q_px=q_px, q_sma=q_sma, basket_vol=basket_vol, vols=vols, size=size,
                 partial=partial, bar_date=comp.index[-1].date(), comp=comp, live=live)
+
+
+def hourly_trips(comp, hourly, members, p, since):
+    """Filter trips on HOURLY bars since the last rebalance, like the algo with filter_check=hourly: each hourly close
+    is compared with the daily SMAs / momentum as of the previous completed day."""
+    names = [t for t in members if t in comp.columns and t in hourly.columns]
+    c = comp[names]
+    fast_d = c.rolling(p["fast"]).mean()
+    slow_d = c.rolling(p["slow"]).mean()
+    moms = [c / c.shift(n) - 1 for n in lens(p["momentum"])]
+    blend_d = sum(moms) / len(moms)
+    allpos_d = moms[0] > 0
+    for m in moms[1:]:
+        allpos_d &= m > 0
+    q_d = comp[BENCH].dropna() if BENCH in comp else pd.Series(dtype=float)
+    sma_d = q_d.rolling(p["market_sma"]).mean()
+    out, above_prev, breadth_hit, cross_hit = [], None, None, None
+    for ts, row in hourly.iterrows():
+        d = ts.date()
+        base = comp.index[comp.index.date < d]
+        if not len(base):
+            continue
+        r = base[-1]
+        # QQQ / DIA fresh cross below its SMA on an hourly close
+        sma = sma_d.get(r, np.nan)
+        qpx = row.get(BENCH, np.nan)
+        if pd.notna(sma) and pd.notna(qpx):
+            above = bool(qpx >= sma)                      # plain bool (numpy bools fail "is True")
+            if d >= since and cross_hit is None and above_prev is True and not above:
+                cross_hit = (d, f"{BENCH} {qpx:.2f} crossed below its {p['market_sma']}-day SMA {sma:.2f} "
+                                f"at {ts:%a %H:%M}")
+            above_prev = above
+        # breadth on the hourly close
+        if d >= since and breadth_hit is None:
+            px = row.reindex(names)
+            qual = (fast_d.loc[r] > slow_d.loc[r]) & (px > slow_d.loc[r])
+            if p["mom_positive"] == "blend":
+                qual &= blend_d.loc[r] > 0
+            elif p["mom_positive"] == "all":
+                qual &= allpos_d.loc[r]
+            ready = slow_d.loc[r].notna() & blend_d.loc[r].notna() & px.notna()
+            share = (qual & ready).sum() / max(len(members), 1)
+            if share <= p["breadth_min"]:
+                breadth_hit = (d, f"breadth {share:.0%} at {ts:%a %H:%M}")
+    return [x for x in (breadth_hit, cross_hit) if x]
 
 
 def n_ready(df):
@@ -427,7 +500,7 @@ def build_orders(sig, p, holdings):
 
 
 # ───────────────────────── app ─────────────────────────
-STATE = {"members": None, "members_choice": None, "members_time": None, "close": None}
+STATE = {"members": None, "members_choice": None, "members_time": None, "close": None, "hourly": None}
 
 
 def card(title, value, sub="", color=TEXT):
@@ -513,6 +586,9 @@ app.layout = html.Div(style={"background": BG, "minHeight": "100vh", "padding": 
                                                     num("teo_slope", DEFAULTS["teo_slope"], 1)],
                                                    style={"display": "flex", "gap": "4px"})),
         field("TEO flat", num("teo_flat", DEFAULTS["teo_flat"], 0.005)),
+        field("Market checks", dd("checks", DEFAULTS["checks"],
+                                  [{"label": "hourly", "value": "hourly"}, {"label": "at the close", "value": "close"}],
+                                  "120px")),
         field("Deep / active / dead", html.Div([num("teo_deep", DEFAULTS["teo_deep"], 0.05),
                                                 num("teo_active", DEFAULTS["teo_active"], 0.05),
                                                 num("teo_dead", DEFAULTS["teo_dead"], 0.01)],
@@ -524,6 +600,7 @@ app.layout = html.Div(style={"background": BG, "minHeight": "100vh", "padding": 
                            "padding": "8px 16px", "fontWeight": 600, "cursor": "pointer", "height": "34px"}),
     ]),
 
+    dcc.Interval(id="tick", interval=60 * 60 * 1000, n_intervals=0),    # hourly auto refresh
     dcc.Loading(type="dot", color=ACCENT, children=[
         html.Div(id="error", style={"color": BAD, "marginBottom": "8px"}),
         html.Div(id="cards", style={"display": "flex", "flexWrap": "wrap", "gap": "10px", "marginBottom": "14px"}),
@@ -544,7 +621,7 @@ app.layout = html.Div(style={"background": BG, "minHeight": "100vh", "padding": 
     Output("sub", "children"), Output("error", "children"), Output("cards", "children"),
     Output("orders", "children"), Output("g_corr", "figure"), Output("g_breadth", "figure"),
     Output("g_qqq", "figure"), Output("g_scores", "figure"), Output("all", "children"), Output("notes", "children"),
-    Input("refresh", "n_clicks"),
+    Input("refresh", "n_clicks"), Input("tick", "n_intervals"), Input("checks", "value"),
     Input("source", "value"), Input("equity", "value"), Input("leverage", "value"), Input("vol_target", "value"),
     Input("vol_lookbacks", "value"), Input("vol_min_size", "value"), Input("top", "value"),
     Input("breadth_min", "value"), Input("momentum", "value"), Input("mom_method", "value"),
@@ -555,7 +632,7 @@ app.layout = html.Div(style={"background": BG, "minHeight": "100vh", "padding": 
     Input("teo_active", "value"), Input("teo_dead", "value"),
     State("refresh", "n_clicks_timestamp"),
 )
-def update(n_clicks, source, equity, leverage, vol_target, vol_lookbacks, vol_min_size, top, breadth_min,
+def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_lookbacks, vol_min_size, top, breadth_min,
            momentum, mom_method, mom_positive, fast, slow, market_sma, holdings,
            teo_filter="on", teo_len=21, teo_smooth=7, teo_slope=6, teo_flat=0.02,
            teo_deep=0.50, teo_active=0.25, teo_dead=0.10, _ts=None):
@@ -572,11 +649,13 @@ def update(n_clicks, source, equity, leverage, vol_target, vol_lookbacks, vol_mi
                  teo_len=int(teo_len or 21), teo_smooth=int(teo_smooth or 1), teo_slope=max(int(teo_slope or 6), 1),
                  teo_flat=float(teo_flat or 0), teo_deep=float(teo_deep if teo_deep is not None else 0.5),
                  teo_active=float(teo_active if teo_active is not None else 0.25),
-                 teo_dead=float(teo_dead if teo_dead is not None else 0.1))
+                 teo_dead=float(teo_dead if teo_dead is not None else 0.1), checks=checks or DEFAULTS["checks"])
         try:
-            force = ctx.triggered_id == "refresh"
+            trig = ctx.triggered_id
         except Exception:  # noqa: BLE001  (called outside a callback)
-            force = False
+            trig = None
+        force = trig == "refresh"                       # Refresh button: members + prices
+        reprice = force or trig == "tick"               # hourly tick: prices only
         stale = STATE["members_time"] is None or (dt.datetime.now() - STATE["members_time"]).total_seconds() > 12 * 3600
         if STATE["members"] is None or STATE["members_choice"] != source or stale or force:
             STATE["members"] = get_members(source)
@@ -584,11 +663,20 @@ def update(n_clicks, source, equity, leverage, vol_target, vol_lookbacks, vol_mi
             STATE["members_time"] = dt.datetime.now()
             STATE["close"] = None
         mem = STATE["members"]
-        if STATE["close"] is None or force:
+        if STATE["close"] is None or reprice:
             STATE["close"] = load_prices(mem["tickers"])
+            STATE["hourly"] = None
         close = STATE["close"]
+        hourly, hourly_err = None, ""
+        if p["checks"] == "hourly":
+            if STATE.get("hourly") is None or reprice:
+                try:
+                    STATE["hourly"] = load_hourly(mem["tickers"])
+                except Exception as e:  # noqa: BLE001
+                    STATE["hourly"], hourly_err = None, str(e)
+            hourly = STATE.get("hourly")
 
-        sig = signals(close, p, mem["tickers"])
+        sig = signals(close, p, mem["tickers"], hourly)
         held = _clean((holdings or "").replace(";", ",").replace(" ", ",").split(","))
         orders, per_name = build_orders(sig, p, held)
 
@@ -600,7 +688,7 @@ def update(n_clicks, source, equity, leverage, vol_target, vol_lookbacks, vol_mi
         sub = [html.Span(src_txt if from_cnbc else f"⚠ NOT from CNBC - {src_txt}",
                          style={"color": TEXT if from_cnbc else BAD, "fontWeight": 400 if from_cnbc else 600}),
                html.Span(f"  ·  prices via yfinance  ·  indicators through {sig['bar_date']}"
-                         f"{'  ·  market open: using the last close (checks are at the close)' if sig['partial'] else ''}"
+                         f"{('  ·  checks HOURLY: price = hourly close ' + format(sig['last_hour'], '%a %H:%M')) if sig['use_hourly'] else ('  ·  market open: using the last close (checks are at the close)' if sig['partial'] else '')}"
                          f"  ·  updated {dt.datetime.now():%Y-%m-%d %H:%M}")]
         q_above = sig["q_px"] >= sig["q_sma"] if not math.isnan(sig["q_sma"]) else None
         out = sig["risk_off"] or sig["out_now"]
@@ -614,7 +702,8 @@ def update(n_clicks, source, equity, leverage, vol_target, vol_lookbacks, vol_mi
                   + (" · next rebalance decides" if sig["preview"] else ""),
                   BAD if sig["risk_off"] else GOOD)),
             card("Since last rebalance", "No filter trips" if not sig["trips"] else "Filter tripped",
-                 (f"checked every close since {sig['since']:%a %b %d}" if not sig["trips"] else
+                 (f"checked every {'hour' if sig['use_hourly'] else 'close'} since {sig['since']:%a %b %d}"
+                  if not sig["trips"] else
                   " · ".join(f"{d_:%a}: {w_}" for d_, w_ in sig["trips"]))
                  + (" · Monday's rebalance resumes if breadth > min" if sig["trips"] and sig["preview"] else ""),
                  GOOD if not sig["trips"] else (WARN if sig["preview"] else BAD)),
@@ -732,6 +821,8 @@ def update(n_clicks, source, equity, leverage, vol_target, vol_lookbacks, vol_mi
             ])
 
         notes = []
+        if p["checks"] == "hourly" and not sig["use_hourly"]:
+            notes.append(f"Hourly prices could not be loaded ({hourly_err or 'no data'}) - showing at-the-close checks.")
         if mem.get("notes"):
             notes.append("Sources that failed before this one: " + " | ".join(mem["notes"]))
         if missing:
