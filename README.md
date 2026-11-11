@@ -90,12 +90,36 @@ SMAs, momentum, TEO and basket vol always use completed daily bars.
   HOLD / RESIZE and SELL with target dollars, shares and margin per stock. On the Nasdaq dashboard a holding that hit
   the hourly 200-day stop since Monday shows as SELL with the time it happened.
 - **Charts:** 63-day correlation of the picks, breadth over the last year, the index vs its SMA, momentum of the top
-  candidates.
+  candidates, and the index P/E over the last 3 years (see below).
+- **P/E card:** today's trailing-12-month P/E of the stocks traded (Dow 30 / QQQ top 30), its 3-year average, how much of the last 3 years
+  was lower (amber at 80%+, green at 20% or less), the P/E a year ago, and Yahoo's own QQQ / DIA P/E as a cross-check (for QQQ that covers all ~100 holdings, so it will differ from
+  the top-30 figure).
 - **All members table:** sortable and filterable, with qualify, rank, momentum, SMAs, TEO value, slope and stage,
-  and market cap (Nasdaq).
+  each stock's own TTM P/E (blank = a loss), and market cap (Nasdaq).
   Picks are starred; stocks removed by TEO are marked "TEO out".
 - **Controls:** every algo parameter can be changed at the top of the page. **Refresh data** reloads prices,
   the member list and (Nasdaq) the Invesco weights.
+
+## Index P/E (rolling, trailing 12 months)
+
+No free source has a P/E history for the Dow 30 or the Nasdaq-100 (Yahoo gives QQQ / DIA only as a single
+number for today), so the dashboard builds it from the members:
+
+- **EPS:** each member's quarterly reported EPS from Yahoo's earnings calendar (`get_earnings_dates`, about 5 years).
+  These are adjusted ("street") EPS, so the P/E reads a little lower than one on GAAP earnings. TTM EPS = the last
+  4 quarters, counted from the day the report is out (after-close reports from the next day).
+- **Prices:** split-adjusted closes without the dividend adjustment.
+- **Basket:** Dow = one share of each member (price-weighted, like the index): P/E = sum of prices / sum of EPS.
+  Nasdaq = the top 30 the dashboard trades, at today's QQQ fund weights (Invesco; Yahoo market cap if Invesco
+  can't be read), held through time. Losses count as negative earnings.
+- **Splits:** if Yahoo has not put older EPS on today's share basis, the dashboard does (checked per split).
+- **Left out:** members with no EPS, under 4 quarters of EPS, or a P/E under 4 (usually EPS in a foreign currency
+  vs a US-dollar price). They are listed in the notes. A day needs members worth 80% of the basket to get a P/E.
+- **Speed:** EPS are pulled once a day and saved in `nasdaq_eps_cache.json` / `dow_eps_cache.json`, so the first
+  start of the day takes a little longer. If Yahoo fails for a stock, its last saved
+  EPS are used and the notes say so. Prices for the P/E are reloaded at most once an hour.
+- It uses today's member list for the whole history, so it is "today's index, back-tested", not the P/E
+  published at the time. Expect it to be close to WSJ's / Yahoo's figures, not identical.
 
 ## Known differences from the algos
 

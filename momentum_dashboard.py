@@ -354,6 +354,210 @@ def load_hourly(tickers):
     return h[ends <= now]                                 # drop the hour still in progress
 
 
+# ───────────────────────── index P/E (trailing 12 months, rolling) ─────────────────────────
+# No free source has a P/E HISTORY for the Dow 30 or the Nasdaq-100, so it is built here from the members:
+#   * EPS     : each member's quarterly reported EPS from Yahoo's earnings calendar (the numbers on its "Earnings"
+#               page). These are adjusted ("street") EPS, so the P/E reads a little lower than one on GAAP earnings.
+#               TTM EPS = the last 4 reported quarters, counted from the day the report is out (after-close reports
+#               from the next day) - no look-ahead. EPS only change on earnings days, so they are pulled once a day
+#               and saved next to the script (<index>_eps_cache.json).
+#   * Prices  : split-adjusted closes WITHOUT the dividend adjustment (a P/E needs the real price).
+#   * Basket  : Dow (price-weighted)  -> one share of each member:  P/E = sum(price) / sum(TTM EPS)
+#               Nasdaq (top 30)       -> the 30 stocks traded, at today's QQQ fund weights (Invesco), held through time:
+#                                        units = fund weight / today's price, P/E = sum(units x price) / sum(units x EPS)
+#   Losses count as negative earnings (how index P/Es are built). Today's member list is used for the whole history.
+PE_LABEL = "QQQ top 30" if CFG.get("index_top") else CFG["name"]      # what the P/E is of
+PE_CACHE_FILE = Path(__file__).with_name(f"{INDEX_KEY}_eps_cache.json")
+PE_YEARS = 3              # years shown on the chart (5 years of prices are loaded for the split check)
+PE_MIN_COVER = 0.80       # a day's P/E needs members with TTM EPS worth >= 80% of the basket
+PE_MAX_AGE = 200          # days: a TTM EPS older than this (no new report) is dropped
+
+
+def _eps_one(t, tries=2):
+    """One member's quarterly EPS from Yahoo: (ticker, {"eps": [[effective date, EPS], ...], "est": next estimate,
+    "asof": today} or None, error)."""
+    last = ""
+    for attempt in range(tries):
+        try:
+            df = yf.Ticker(t).get_earnings_dates(limit=25)          # ~5 years of quarters + the upcoming ones
+            if df is None or df.empty or "Reported EPS" not in df:
+                return t, None, "no earnings data on Yahoo"
+            rep = pd.to_numeric(df["Reported EPS"], errors="coerce")
+            est = pd.to_numeric(df.get("EPS Estimate"), errors="coerce") if "EPS Estimate" in df else rep * np.nan
+            idx = pd.to_datetime(df.index)
+            idx = idx.tz_convert(ET) if idx.tz is not None else idx.tz_localize(ET)
+            rows, today = {}, pd.Timestamp(dt.datetime.now(ET))
+            for ts, v in zip(idx, rep):
+                if pd.notna(v) and ts <= today:
+                    eff = ts.normalize() + pd.Timedelta(days=1 if ts.hour >= 16 else 0)   # after the close -> next day
+                    rows[eff.date().isoformat()] = float(v)
+            fut = [(ts, e) for ts, r, e in zip(idx, rep, est) if pd.isna(r) and pd.notna(e) and ts > today]
+            nxt = float(min(fut)[1]) if fut else None
+            if not rows:
+                return t, None, "no reported EPS on Yahoo"
+            return t, {"eps": sorted(rows.items()), "est": nxt, "asof": dt.date.today().isoformat()}, ""
+        except Exception as e:  # noqa: BLE001
+            last = str(e)[:120] or type(e).__name__
+            time.sleep(1.5 * (attempt + 1))
+    return t, None, last
+
+
+def load_eps(tickers):
+    """EPS for every ticker: today's saved copy if there is one, else Yahoo. A ticker Yahoo can't give today keeps
+    its last saved EPS. Returns ({ticker: data}, {ticker: problem})."""
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        data = json.loads(PE_CACHE_FILE.read_text()).get("data", {})
+    except Exception:  # noqa: BLE001
+        data = {}
+    today = dt.date.today().isoformat()
+    need = [t for t in tickers if (data.get(t) or {}).get("asof") != today]
+    probs = {}
+    if need:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for t, d, err in ex.map(_eps_one, need):
+                if d:
+                    data[t] = d
+                elif data.get(t):
+                    probs[t] = f"Yahoo failed today ({err}) - EPS saved {data[t].get('asof')}"
+                else:
+                    probs[t] = err
+        try:
+            PE_CACHE_FILE.write_text(json.dumps({"saved": dt.datetime.now().isoformat(timespec="minutes"),
+                                                 "data": data}))
+        except OSError:
+            pass
+    return {t: data[t] for t in tickers if t in data}, probs
+
+
+def load_pe_prices(tickers):
+    """Split-adjusted (not dividend-adjusted) daily closes and stock splits, 5 years."""
+    data = yf.download(sorted(set(tickers)), period="5y", interval="1d", auto_adjust=False, actions=True,
+                       progress=False, group_by="column", threads=True)
+    if not isinstance(data.columns, pd.MultiIndex):                 # one ticker: make it look like many
+        data.columns = pd.MultiIndex.from_product([data.columns, list(tickers)[:1]])
+    close = data["Close"].dropna(how="all", axis=1).sort_index()
+    lvl0 = data.columns.get_level_values(0)
+    splits = data["Stock Splits"].reindex(columns=close.columns) if "Stock Splits" in lvl0 else close * np.nan
+    close.index = splits.index = pd.to_datetime(close.index).tz_localize(None)
+    return close, splits.fillna(0.0)
+
+
+def split_adjust(eps, est, splits):
+    """Put EPS reported before a split on today's share basis if Yahoo has not already. For each split, the
+    reports just before it are compared with the ones just after it (or the next estimate, if there are no
+    reports since): if they differ by about the split ratio, the older EPS are divided by it."""
+    s = eps.copy()
+    for d, r in splits[splits > 0].items():
+        if r == 1:
+            continue
+        before = s[s.index < d].tail(2).abs().median()
+        after_s = s[s.index >= d].head(2).abs()
+        after = after_s.median() if len(after_s) else (abs(est) if est else np.nan)
+        if not (before > 0 and after > 0):
+            continue
+        lr = math.log(before / after)
+        if abs(lr - math.log(r)) < abs(lr):
+            s[s.index < d] = s[s.index < d] / r
+    return s
+
+
+def ttm_eps(s):
+    """TTM EPS on each report's effective date: the last 4 quarters, only if they span under ~11 months.
+    Two rows within 40 days of each other are the same quarter (the later one is kept)."""
+    s = s.sort_index()
+    gap = s.index.to_series().diff().dt.days.shift(-1)          # days to the NEXT row
+    s = s[~(gap < 40)]
+    span = s.index.to_series().diff(3).dt.days
+    return s.rolling(4).sum().where(span <= 330).dropna()
+
+
+def index_pe(close, splits, eps, units):
+    """Rolling TTM P/E of the index basket.
+    close / splits: split-adjusted closes and splits; eps: {ticker: load_eps data}; units: {ticker: units held}.
+    Returns (P/E series, coverage series, {ticker: today's P/E or None if a loss}, {ticker: why left out})."""
+    idx = close.index
+    vals, earns, total, per_name, out = {}, {}, {}, {}, {}
+    for t, u in units.items():
+        px = close[t] if t in close else None
+        if px is None or px.dropna().empty or not u or u <= 0:
+            out[t] = "no price"
+            continue
+        total[t] = px * u
+        d = eps.get(t)
+        if not d or not d.get("eps"):
+            out[t] = "no EPS"
+            continue
+        s = pd.Series({pd.Timestamp(a): v for a, v in d["eps"]}, dtype=float)
+        s = split_adjust(s, d.get("est"), splits[t] if t in splits else pd.Series(dtype=float))
+        tt = ttm_eps(s)
+        if tt.empty:
+            out[t] = "under 4 quarters of EPS"
+            continue
+        full = idx.union(tt.index)
+        e = tt.reindex(full).ffill().reindex(idx)
+        last_rep = pd.Series(tt.index, index=tt.index).reindex(full).ffill().reindex(idx)
+        e = e.where((idx - last_rep).dt.days <= PE_MAX_AGE)
+        p_now, e_now = px.dropna().iloc[-1], e.dropna().iloc[-1] if e.notna().any() else np.nan
+        if e_now > 0 and p_now / e_now < 4:                       # e.g. EPS in another currency than the price
+            out[t] = f"P/E {p_now / e_now:.1f} looks wrong (EPS in another currency?)"
+            continue
+        per_name[t] = round(p_now / e_now, 1) if e_now > 0 else None
+        vals[t], earns[t] = px * u, e * u
+    if not vals:
+        return pd.Series(dtype=float), pd.Series(dtype=float), per_name, out
+    V, E, T = pd.DataFrame(vals), pd.DataFrame(earns), pd.DataFrame(total)
+    ok = V.notna() & E.notna()
+    num, den = V.where(ok).sum(axis=1), E.where(ok).sum(axis=1)
+    cover = num / T.sum(axis=1, min_count=1)
+    pe = (num / den).where((cover >= PE_MIN_COVER) & (den > 0))
+    return pe.dropna(), cover, per_name, out
+
+
+def bench_pe():
+    """Yahoo's own trailing P/E for the ETF (QQQ / DIA) - a single number, used as a cross-check."""
+    try:
+        v = yf.Ticker(BENCH).info.get("trailingPE")
+        return float(v) if v else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def load_pe(members):
+    """Everything the P/E card / chart / table need, for the stocks the dashboard trades (Dow: all 30;
+    Nasdaq: the top 30 by QQQ fund weight). Reloaded at most once an hour (EPS once a day)."""
+    old = STATE.get("pe")
+    if old and (dt.datetime.now() - old["time"]).total_seconds() < 55 * 60 and old["key"] == sorted(members):
+        return old
+    if INDEX_KEY == "dow":
+        names, basis = list(members), "one share of each member (price-weighted, like the Dow)"
+        wts = None
+    else:
+        wts = STATE.get("weights") or {}
+        basis = f"the top {len(members)} traded, at their QQQ fund weights (Invesco)"
+        if not all(wts.get(t) for t in members):
+            wts = STATE.get("caps") or market_caps(members)
+            basis = f"the top {len(members)} traded, by Yahoo market cap (Invesco weights unavailable)"
+        names = [t for t in members if wts.get(t)]
+    close, splits = load_pe_prices(names)
+    if INDEX_KEY == "dow":
+        units = {t: 1.0 for t in names}
+    else:
+        last = close.ffill().iloc[-1]
+        units = {t: wts[t] / last[t] for t in names if t in last and last[t] > 0}
+    eps, probs = load_eps(names)
+    pe, cover, per_name, out = index_pe(close, splits, eps, units)
+    stale = {}
+    for t, why in probs.items():
+        if out.get(t, "no EPS") == "no EPS" and t not in per_name:
+            out[t] = why                                          # left out: say why Yahoo failed
+        else:
+            stale[t] = why                                        # still in, on its last saved EPS
+    STATE["pe"] = dict(pe=pe, cover=cover, per_name=per_name, out=out, stale=stale, basis=basis, n=len(names),
+                       bench=bench_pe(), time=dt.datetime.now(), key=sorted(members))
+    return STATE["pe"]
+
+
 def split_completed(close):
     """Completed daily bars and the latest CLOSE. All checks are at-the-close: while the market is open, today's
     partial bar is ignored and everything uses yesterday's close."""
@@ -808,6 +1012,7 @@ app.layout = html.Div(style={"background": BG, "minHeight": "100vh", "padding": 
                         "gap": "12px", "marginTop": "14px"}, children=[
             dcc.Graph(id="g_corr"), dcc.Graph(id="g_breadth"), dcc.Graph(id="g_qqq"), dcc.Graph(id="g_scores"),
         ]),
+        html.Div(dcc.Graph(id="g_pe"), style={"marginTop": "12px"}),
         html.H3("All members", style={"margin": "16px 0 6px 0"}),
         html.Div(id="all"),
         html.Div(id="notes", style={"color": MUTED, "fontSize": "12px", "marginTop": "10px"}),
@@ -818,7 +1023,8 @@ app.layout = html.Div(style={"background": BG, "minHeight": "100vh", "padding": 
 @app.callback(
     Output("sub", "children"), Output("error", "children"), Output("cards", "children"),
     Output("orders", "children"), Output("g_corr", "figure"), Output("g_breadth", "figure"),
-    Output("g_qqq", "figure"), Output("g_scores", "figure"), Output("all", "children"), Output("notes", "children"),
+    Output("g_qqq", "figure"), Output("g_scores", "figure"), Output("g_pe", "figure"), Output("all", "children"),
+    Output("notes", "children"),
     Input("refresh", "n_clicks"), Input("tick", "n_intervals"), Input("checks", "value"),
     Input("source", "value"), Input("equity", "value"), Input("leverage", "value"), Input("vol_target", "value"),
     Input("vol_lookbacks", "value"), Input("vol_min_size", "value"), Input("top", "value"),
@@ -889,6 +1095,13 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
         held = _clean((holdings or "").replace(";", ",").replace(" ", ",").split(","))
         orders, per_name = build_orders(sig, p, held)
 
+        # ── index P/E (its own try: a Yahoo problem here never breaks the signals)
+        pe_err = ""
+        try:
+            pe_d = load_pe(members)
+        except Exception as e:  # noqa: BLE001
+            pe_d, pe_err = None, str(e)[:300]
+
         # ── header + cards
         missing = [t for t in members if t not in close.columns]
         top_txt = (f"top {len(members)} by {size_by} of " if CFG.get("index_top") and not size_note else "")
@@ -938,6 +1151,19 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
                  + (f" · {len(sig['top'])} picks left" if len(sig["top"]) < p["top"] else ""),
                  WARN if sig["teo_out"] else GOOD),
         ]
+        pe_s = pe_d["pe"] if pe_d else pd.Series(dtype=float)
+        if len(pe_s):
+            hist = pe_s[pe_s.index >= pe_s.index[-1] - pd.DateOffset(years=PE_YEARS)]
+            now_pe, pct = pe_s.iloc[-1], (hist < pe_s.iloc[-1]).mean()
+            yr = pe_s[pe_s.index <= pe_s.index[-1] - pd.DateOffset(years=1)]
+            cards.append(card(f"{PE_LABEL} P/E (TTM)", f"{now_pe:.1f}x",
+                              f"{PE_YEARS}-yr avg {hist.mean():.1f}x · {pct:.0%} of days lower"
+                              + (f" · 1 yr ago {yr.iloc[-1]:.1f}x" if len(yr) else "")
+                              + (f" · Yahoo {BENCH} {pe_d['bench']:.1f}x" + (" (all holdings)" if CFG.get("index_top") else "")
+                                 if pe_d.get("bench") else ""),
+                              WARN if pct >= 0.8 else (GOOD if pct <= 0.2 else TEXT)))
+        else:
+            cards.append(card(f"{PE_LABEL} P/E (TTM)", "n/a", "could not build it - see the notes below", MUTED))
 
         # ── orders table
         ocols = ["Ticker", "Action", "Why", "Price", "Target $", "Shares", "Margin $"]
@@ -992,6 +1218,23 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
         g_s.update_layout(barmode="group")
         g_s.update_yaxes(ticksuffix="%")
 
+        # ── rolling index P/E
+        if len(pe_s):
+            h = pe_s[pe_s.index >= pe_s.index[-1] - pd.DateOffset(years=PE_YEARS)]
+            m, sd = h.mean(), h.std()
+            g_pe = go.Figure(go.Scatter(x=h.index, y=h, mode="lines", line=dict(color=ACCENT), name="P/E (TTM)"))
+            g_pe.add_hline(y=m, line=dict(color=TEXT, dash="dash"), annotation_text=f"avg {m:.1f}x",
+                           annotation_font_color=TEXT)
+            for k in (-1, 1):
+                g_pe.add_hline(y=m + k * sd, line=dict(color=MUTED, dash="dot"),
+                               annotation_text=f"{'+' if k > 0 else '-'}1 sd {m + k * sd:.1f}x",
+                               annotation_font_color=MUTED)
+            fig_layout(g_pe, f"{PE_LABEL} P/E on trailing-12-month EPS, last {PE_YEARS} years "
+                             f"(now {h.iloc[-1]:.1f}x)", 360)
+            g_pe.update_yaxes(ticksuffix="x")
+        else:
+            g_pe = fig_layout(go.Figure(), f"{PE_LABEL} P/E (TTM) - not available", 360)
+
         # ── all members table
         show = df.copy()
         for c in ["Price", "SMA fast", "SMA slow"]:
@@ -1015,12 +1258,14 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
         fw = STATE.get("weights") or {}
         if fw:
             show["QQQ wt %"] = show["Ticker"].map(lambda t: round(fw[t], 2) if fw.get(t) is not None else None)
+        if pe_d and pe_d.get("per_name"):
+            show["P/E"] = show["Ticker"].map(pe_d["per_name"].get)
         w = mem.get("weights") or {}
         if any(v is not None for v in w.values()):
             show["Index wt %"] = show["Ticker"].map(lambda t: w.get(t))
         order_cols = [c for c in ["Pick", "Rank", "Ticker", "Price", "Qualifies", "Score"] + mcols +
                       ["TEO", "TEO slope", "TEO stage", "SMA fast", "SMA slow", "Vs 200d %",
-                       "QQQ wt %", "Mkt cap $B", "Index wt %", "Ready"] if c in show]
+                       "P/E", "QQQ wt %", "Mkt cap $B", "Index wt %", "Ready"] if c in show]
         show = show[order_cols].sort_values(["Rank", "Ticker"], na_position="last")
         all_tbl = dash_table.DataTable(
             data=show.to_dict("records"), columns=[{"name": c, "id": c} for c in order_cols],
@@ -1046,6 +1291,19 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
                             "(Portfolio -> Export data) into the dashboard folder."))
         if p["checks"] == "hourly" and not sig["use_hourly"]:
             notes.append(f"Hourly prices could not be loaded ({hourly_err or 'no data'}) - showing at-the-close checks.")
+        if pe_err:
+            notes.append(f"P/E could not be built: {pe_err}")
+        elif pe_d:
+            cov = pe_d["cover"].dropna()
+            notes.append(f"{PE_LABEL} P/E: trailing-12-month reported EPS (Yahoo earnings calendar, adjusted EPS) of "
+                         f"{pe_d['n']} names, basket = {pe_d['basis']}; split-adjusted prices without the dividend "
+                         f"adjustment; losses count as negative earnings; today's member list for the whole history"
+                         + (f"; members with EPS cover {cov.iloc[-1]:.0%} of the basket today" if len(cov) else "")
+                         + ". P/E column = each member's own TTM P/E (blank = a loss).")
+            if pe_d["out"]:
+                notes.append("Left out of the P/E: " + "; ".join(f"{t} ({w_})" for t, w_ in sorted(pe_d["out"].items())))
+            if pe_d.get("stale"):
+                notes.append("P/E uses older saved EPS for: " + "; ".join(f"{t} ({w_})" for t, w_ in sorted(pe_d["stale"].items())))
         if mem.get("notes"):
             notes.append("Sources that failed before this one: " + " | ".join(mem["notes"]))
         if missing:
@@ -1056,10 +1314,10 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
         notes.append(f"Same rules as the latest algo. Differences: breadth here divides by ALL members (the algo divides by "
                      f"members with enough history); the breadth chart uses today's member list for the whole year; "
                      f"market holidays are not skipped when working out 'since last rebalance'.")
-        return (sub, "", cards, orders_tbl, g_corr, g_b, g_q, g_s, all_tbl,
+        return (sub, "", cards, orders_tbl, g_corr, g_b, g_q, g_s, g_pe, all_tbl,
                 [html.Div(n) for n in notes])
     except Exception as e:  # noqa: BLE001
-        return ("", f"Error: {e}", [], "", empty, empty, empty, empty, "", "")
+        return ("", f"Error: {e}", [], "", empty, empty, empty, empty, empty, "", "")
 
 
 def run():
