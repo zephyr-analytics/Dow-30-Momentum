@@ -36,17 +36,17 @@ dashboard falls back to Wikipedia's member table, then to the last list it saved
 
 Prices come from Yahoo Finance via yfinance (3 years of dividend-adjusted daily bars).
 
-## Rules (same as the latest QQQ algo; Dow identical except DIA and no vol target)
+## Rules (same as the QQQ and Dow algos)
 
-1. **Qualify:** 10-day SMA above 200-day SMA, price above 200-day SMA, blended 21/63/126-day momentum positive.
+1. **Qualify:** 10-day SMA above 200-day SMA, price above 200-day SMA, blended momentum positive (Nasdaq: 21 + 126 days; Dow: 21 + 63 + 126 days).
 2. **TEO filter:** qualifying stocks whose Trend Efficiency Oscillator stage is **Exhausting** are removed before
    ranking. TEO = signed Kaufman efficiency ratio (21 days), EMA-smoothed (7); stage from the 6-day slope with fixed
    zones 0.50 / 0.25 / 0.10 and flat threshold 0.02.
-3. **Ranking:** average rank on 21, 63 and 126-day returns; the top 10 are the picks.
-4. **Breadth:** share of ALL members that qualify (rule 1). At or below 40% = risk-off, hold nothing.
+3. **Ranking:** average rank on each momentum return; the top 10 are the picks.
+4. **Breadth:** share of ALL members that qualify (rule 1). At or below the minimum (Nasdaq 30%, Dow 40%) = risk-off, hold nothing.
 5. **Index SMA:** a fresh close of QQQ / DIA below its 200-day SMA also goes to cash.
 6. **When filters are checked:** Nasdaq every hour, Dow at every daily close (see below). A trip means cash until
-   the next Monday rebalance, which resumes if breadth is above 40%.
+   the next Monday rebalance, which resumes if breadth is above the minimum.
 7. **Sizing:** leverage 2.5, each pick gets size x 2.5 / 10 of the account. Nasdaq: size = 35% / (2.5 x basket vol),
    capped at 100% (basket vol = higher of the 21 and 63-day realized vol of the 10 picks). Dow: always 100%.
 8. **No per-stock stop:** holdings change only at the Monday rebalance or when a market filter trips.

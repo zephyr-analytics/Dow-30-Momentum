@@ -13,7 +13,8 @@ Mirrors the latest QuantConnect algo (the QQQ version):
   * TEO filter : qualifying stocks whose Trend Efficiency Oscillator stage is EXHAUSTING are removed BEFORE ranking;
                  the top 10 come from the rest. TEO = signed Kaufman efficiency ratio (21d), EMA-smoothed (7),
                  stage from the 6-day direction-aware slope. Breadth is not affected.
-  * Breadth    : risk-off if breadth_min (40%) OR FEWER of the members qualify -> hold nothing.
+  * Breadth    : risk-off if breadth_min (Nasdaq 30%, Dow 40%) OR FEWER of the members qualify -> hold nothing.
+  * Momentum   : Nasdaq 21 + 126 days, Dow 21 + 63 + 126 days.
   * Index SMA  : the algo also goes to cash on a FRESH cross of the market ETF (QQQ / DIA) below its 200-day SMA,
                  judged at the daily close. Both filters are checked at every close; once out, the algo stays in cash
                  until the next Monday rebalance, and resumes there if breadth is above breadth_min.
@@ -65,10 +66,12 @@ DEFAULTS = dict(
     equity=10_000,
 )
 INDEXES = {
-    "nasdaq": dict(name="Nasdaq-100", bench="QQQ", port=8050, min_n=90, max_n=110, checks="hourly", vol_target=0.35,
+    "nasdaq": dict(name="Nasdaq-100", bench="QQQ", port=8050, min_n=90, max_n=110, checks="hourly",
+                   momentum="21,126", breadth_min=0.30, vol_target=0.35,
                    cnbc=["https://www.cnbc.com/nasdaq-100/", "https://www.cnbc.com/markets/nasdaq-100/"],
                    wiki="https://en.wikipedia.org/wiki/Nasdaq-100", cache="ndx_constituents_cache.json"),
-    "dow": dict(name="Dow 30", bench="DIA", port=8051, min_n=28, max_n=32, checks="close", vol_target=0.0,          # Dow: no vol target
+    "dow": dict(name="Dow 30", bench="DIA", port=8051, min_n=28, max_n=32, checks="close",
+                momentum="21,63,126", breadth_min=0.40, vol_target=0.0,          # Dow: no vol target
                 cnbc=["https://www.cnbc.com/dow-30/", "https://www.cnbc.com/markets/dow-30/"],
                 wiki="https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average", cache="dow_constituents_cache.json"),
 }
@@ -78,6 +81,8 @@ CFG = INDEXES[INDEX_KEY]
 BENCH = CFG["bench"]
 CACHE_FILE = Path(__file__).with_name(CFG["cache"])
 DEFAULTS["checks"] = CFG["checks"]                  # Nasdaq: hourly, Dow: at the close
+DEFAULTS["momentum"] = CFG["momentum"]              # Nasdaq: 21 + 126 days, Dow: 21 + 63 + 126
+DEFAULTS["breadth_min"] = CFG["breadth_min"]        # Nasdaq: 30%, Dow: 40%
 DEFAULTS["vol_target"] = CFG["vol_target"]          # Nasdaq 35%, Dow off (always 100% deployed)
 ET = ZoneInfo("America/New_York")
 UA = {
@@ -643,7 +648,7 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
         p = dict(DEFAULTS)
         p.update(equity=float(equity or 0), leverage=float(leverage or 1), vol_target=float(vol_target or 0),
                  vol_lookbacks=vol_lookbacks or "21,63", vol_min_size=float(vol_min_size or 0),
-                 top=max(int(top or 10), 1), breadth_min=float(breadth_min or 0), momentum=momentum or "21,63,126",
+                 top=max(int(top or 10), 1), breadth_min=float(breadth_min or 0), momentum=momentum or DEFAULTS["momentum"],
                  mom_method=mom_method, mom_positive=mom_positive, fast=int(fast or 10), slow=int(slow or 200),
                  market_sma=int(market_sma or 200), teo_filter=teo_filter or "on",
                  teo_len=int(teo_len or 21), teo_smooth=int(teo_smooth or 1), teo_slope=max(int(teo_slope or 6), 1),
