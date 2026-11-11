@@ -36,10 +36,6 @@ from AlgorithmImports import *
 #              and any in an EXHAUSTING stage is removed BEFORE ranking. The top 10 are then picked from
 #              the rest, so the next-best stock moves up into the 10. Only if fewer than 10 pass do slots stay in cash.
 #              Breadth is NOT affected - it still counts trend + momentum only.
-#              CALIBRATION (teo_calib=on, default): the deep / active / dead zones are set PER STOCK from that stock's
-#              own last teo_calib_bars (1,000 daily bars, about 4 years) of |TEO|: the 85th / 60th / 25th percentiles
-#              (teo_pct_deep / teo_pct_active / teo_pct_dead), refreshed monthly, using only data up to that date.
-#              Stocks with fewer than teo_calib_min (252) bars use the fixed teo_deep / teo_active / teo_dead.
 #  Rebalance : once a week, 15 minutes after Monday's open (Tuesday if Monday is a market holiday).
 #              Set rebalance=daily to go back to every day. Between rebalances only the index filters can sell.
 #  Kill switches (stop trading):
@@ -82,7 +78,6 @@ from AlgorithmImports import *
 #   fast=10  slow=200  momentum=21,63,126  mom_method=rank|return  top=10  leverage=2.5  universe=etf|static  start_year=2010  rebalance=weekly|daily
 #   vol_target=0.35 (0 = off)  vol_lookbacks=21,63  vol_min_size=0
 #   teo_filter=on|off  teo_len=21  teo_smooth=7  teo_slope=6  teo_flat=0.02  teo_deep=0.50  teo_active=0.25  teo_dead=0.10
-#   teo_calib=on|off  teo_calib_bars=1000  teo_calib_min=252  teo_pct_deep=85  teo_pct_active=60  teo_pct_dead=25
 #   market_filter=both|breadth|sma|off  breadth_min=0.40  filter_check=close|hourly
 #   market_sma=200  dd_stop=0 (off) or e.g. 0.25  dd_pause_weeks=4
 #   kalshi=on|off  kalshi_fee=0.0002  funding_mode=rates|fixed|off  funding_spread=0  funding_annual=0.05
@@ -164,14 +159,6 @@ class Dow30MomentumTrend(QCAlgorithm):
         self.teo_active = float(self.get_parameter("teo_active", 0.25))
         self.teo_dead = float(self.get_parameter("teo_dead", 0.10))
         self.teo_flat = float(self.get_parameter("teo_flat", 0.02))
-        # per-stock calibration of the TEO zones (like the TradingView TEO's calibration: 1,000 bars, 85 / 60 / 25)
-        self.teo_calib = self.get_parameter("teo_calib", "on") == "on"
-        self.calib_bars = int(self.get_parameter("teo_calib_bars", 1000))
-        self.calib_min = int(self.get_parameter("teo_calib_min", 252))       # fewer bars -> fixed zones
-        self.pct_deep = float(self.get_parameter("teo_pct_deep", 85))
-        self.pct_active = float(self.get_parameter("teo_pct_active", 60))
-        self.pct_dead = float(self.get_parameter("teo_pct_dead", 25))
-        self.zones = {}                # symbol -> (month key, deep, active, dead)
         self.universe_mode = self.get_parameter("universe", "etf")   # "etf" = point-in-time DIA members, "static" = today's list
         start_year = int(self.get_parameter("start_year", 2010))
         self.rebal_mode = self.get_parameter("rebalance", "weekly")      # "weekly" (Friday) or "daily"
@@ -349,10 +336,9 @@ class Dow30MomentumTrend(QCAlgorithm):
         teo_out = []
         if self.teo_on and cands:
             closes_all = self.daily_closes([sym for sym, _ in cands])
-            self.calibrate([sym for sym, _ in cands])
             passed = []
             for sym, moms in cands:
-                teo, stage = self.teo_now(closes_all, sym, self.zones_for(sym))
+                teo, stage = self.teo_now(closes_all, sym)
                 if stage == 4:                          # Exhausting
                     teo_out.append((sym, teo, stage))
                 else:
@@ -410,54 +396,21 @@ class Dow30MomentumTrend(QCAlgorithm):
         except Exception:  # noqa: BLE001
             return None
 
-    def teo_series(self, closes, sym):
-        """Full TEO series for one stock (same math as the TradingView TEO). None if not enough data."""
+    def teo_now(self, closes, sym):
+        """TEO today and its stage (0 Dormant 1 Building 2 Flat 3 Extended 4 Exhausting 5 Fading). None if no data."""
         if closes is None or sym not in closes.columns:
-            return None
+            return None, None
         c = closes[sym].dropna()
         if len(c) < self.teo_len + self.teo_slope + 2:
-            return None
+            return None, None
         path = c.diff().abs().rolling(self.teo_len).sum()
         er = ((c - c.shift(self.teo_len)) / path.where(path > 0)).fillna(0.0).iloc[self.teo_len:]
-        return er.ewm(span=self.teo_smooth, adjust=False).mean() if self.teo_smooth > 1 else er
-
-    def calibrate(self, syms):
-        """Per-stock TEO zones from the stock's own last calib_bars TEO values (|TEO| percentiles), refreshed
-        once a month. Only data up to today is used, so there is no look-ahead in the backtest."""
-        if not self.teo_calib or not syms:
-            return
-        key = (self.time.year, self.time.month)
-        stale = [s for s in syms if self.zones.get(s, (None,))[0] != key]
-        if not stale:
-            return
-        n = self.calib_bars + self.teo_len + 10 * self.teo_smooth + 60
-        try:
-            closes = self.history(stale, n, Resolution.DAILY)["close"].unstack(level=0)
-        except Exception:  # noqa: BLE001
-            closes = None
-        for sym in stale:
-            teo = self.teo_series(closes, sym)
-            a = teo.abs().tail(self.calib_bars) if teo is not None else None
-            if a is None or len(a) < self.calib_min:
-                self.zones[sym] = (key, self.teo_deep, self.teo_active, self.teo_dead)      # too new: fixed zones
-            else:
-                self.zones[sym] = (key, float(a.quantile(self.pct_deep / 100)), float(a.quantile(self.pct_active / 100)),
-                                   float(a.quantile(self.pct_dead / 100)))
-
-    def zones_for(self, sym):
-        """(deep, active, dead) for a stock: calibrated if available, else the fixed teo_deep / teo_active / teo_dead."""
-        z = self.zones.get(sym) if self.teo_calib else None
-        return z[1:] if z else (self.teo_deep, self.teo_active, self.teo_dead)
-
-    def teo_now(self, closes, sym, zones=None):
-        """TEO today and its stage (0 Dormant 1 Building 2 Flat 3 Extended 4 Exhausting 5 Fading). None if no data."""
-        teo = self.teo_series(closes, sym)
-        if teo is None or len(teo) <= self.teo_slope:
+        teo = er.ewm(span=self.teo_smooth, adjust=False).mean() if self.teo_smooth > 1 else er
+        if len(teo) <= self.teo_slope:
             return None, None
-        deep, active, dead = zones or (self.teo_deep, self.teo_active, self.teo_dead)
         v = float(teo.iloc[-1])
         slope = (1 if v > 0 else -1 if v < 0 else 0) * (v - float(teo.iloc[-1 - self.teo_slope]))
-        return v, teo_stage(v, slope, self.teo_flat, deep, active, dead)
+        return v, teo_stage(v, slope, self.teo_flat, self.teo_deep, self.teo_active, self.teo_dead)
 
     def target_size(self, top, closes=None):
         """Share of the account to deploy this week (0-1). Returns (size, basket vol at 1x or None)."""
