@@ -64,7 +64,6 @@ Shared:
 | | Nasdaq (QQQ top-30 algo) | Dow (Dow 30 algo) |
 |---|---|---|
 | Universe | Top 30 Nasdaq-100 members by QQQ fund weight (Invesco holdings; Yahoo market cap as backup); GOOG dropped so Alphabet counts once; breadth on these 30 | All 30 members |
-| TEO filter | Off | On (Exhausting removed before ranking) |
 | Leverage | 2.0 | 2.5 |
 | Vol target | 35%: size = 0.35 / (2.0 x basket vol), capped at 100% | Off (always 100%) |
 | Per-stock stop | Sold on the first hourly close below its 200-day SMA; cash until Monday | None |
@@ -80,12 +79,12 @@ Shared:
 - **Dow: at the close.** Everything uses completed daily bars. While the market is open, today's partial bar is
   ignored, so signals only change after 4:00 PM ET.
 
-SMAs, momentum, TEO and basket vol always use completed daily bars.
+SMAs, momentum and basket vol always use completed daily bars.
 
 ## What's on the page
 
 - **Cards:** regime (risk-on / risk-off / cash until Monday), since last rebalance (any filter trips this week),
-  breadth, index vs its 200-day SMA, basket vol, portfolio size, gross exposure, expected account vol, TEO removed.
+  breadth, index vs its 200-day SMA, basket vol, portfolio size, gross exposure, expected account vol.
 - **This week's orders:** type your current holdings (comma separated) and set your account size; it lists BUY,
   HOLD / RESIZE and SELL with target dollars, shares and margin per stock. On the Nasdaq dashboard a holding that hit
   the hourly 200-day stop since Monday shows as SELL with the time it happened.
@@ -94,9 +93,9 @@ SMAs, momentum, TEO and basket vol always use completed daily bars.
 - **P/E card:** today's trailing-12-month P/E of the stocks traded (Dow 30 / QQQ top 30), its 3-year average, how much of the last 3 years
   was lower (amber at 80%+, green at 20% or less), the P/E a year ago, and Yahoo's own QQQ / DIA P/E as a cross-check (for QQQ that covers all ~100 holdings, so it will differ from
   the top-30 figure).
-- **All members table:** sortable and filterable, with qualify, rank, momentum, SMAs, TEO value, slope and stage,
+- **All members table:** sortable and filterable, with qualify, rank, momentum, SMAs,
   each stock's own TTM P/E (blank = a loss), and market cap (Nasdaq).
-  Picks are starred; stocks removed by TEO are marked "TEO out".
+  Picks are starred.
 - **Controls:** every algo parameter can be changed at the top of the page. **Refresh data** reloads prices,
   the member list and (Nasdaq) the Invesco weights.
 

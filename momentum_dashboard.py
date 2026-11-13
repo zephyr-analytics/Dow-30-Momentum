@@ -20,10 +20,10 @@ NASDAQ (QQQ top-30 algo):
                  Refresh; if Invesco can't be read, the backups are an exported holdings file, the last good pull,
                  then Yahoo market cap, and the page says so). Members still come from CNBC. GOOG is
                  dropped so Alphabet counts once. Breadth is measured on these 30 only.
-  * No TEO filter. Leverage 2.0. Vol target 35%: size = 0.35 / (2.0 x basket vol), capped at 100%.
+  * Leverage 2.0. Vol target 35%: size = 0.35 / (2.0 x basket vol), capped at 100%.
   * Stop       : a holding is sold on the first HOURLY close below its 200-day SMA (cash until the next rebalance).
 DOW (Dow 30 algo):
-  * Universe   : all 30 members. TEO filter on (Exhausting stocks removed before ranking). Leverage 2.5.
+  * Universe   : all 30 members. Leverage 2.5.
                  No vol target (always 100% deployed). No per-stock stop.
 
 WHEN THE MARKET FILTERS ARE CHECKED ("Market checks" control; default per index):
@@ -33,7 +33,7 @@ WHEN THE MARKET FILTERS ARE CHECKED ("Market checks" control; default per index)
     The page refreshes itself every hour (prices only; the Refresh button also reloads the member list).
   * Dow: AT THE CLOSE - everything uses completed daily bars; while the market is open, today's partial bar is
     ignored, so the signals only change after 4:00 PM ET.
-  SMAs, momentum, TEO and basket vol always use completed daily bars.
+  SMAs, momentum and basket vol always use completed daily bars.
 
 Members come from CNBC's index page (www.cnbc.com/nasdaq-100 or /dow-30). If CNBC can't be read, the dashboard falls
 back to the last list it saved (a json file next to this script), and says so in red at the top.
@@ -63,18 +63,16 @@ DEFAULTS = dict(
     fast=10, slow=200, momentum="21,63,126", mom_method="rank", mom_positive="blend",
     top=10, leverage=2.5, breadth_min=0.40, market_sma=200,
     vol_target=0.35, vol_lookbacks="21,63", vol_min_size=0.0,
-    teo_filter="on", teo_len=21, teo_smooth=7, teo_slope=6, teo_flat=0.02,
-    teo_deep=0.50, teo_active=0.25, teo_dead=0.10,
     equity=10_000,
 )
 INDEXES = {
     "nasdaq": dict(name="Nasdaq-100", bench="QQQ", port=8050, min_n=90, max_n=110, checks="hourly",
-                   momentum="21,63,126", breadth_min=0.40, vol_target=0.35, leverage=2.0, teo_filter="off",
+                   momentum="21,126", breadth_min=0.40, vol_target=0.35, leverage=2.0,
                    index_top=30, exclude=["GOOG"], stop="hourly",       # QQQ top-30 algo
                    cnbc=["https://www.cnbc.com/nasdaq-100/", "https://www.cnbc.com/markets/nasdaq-100/"],
                    cache="ndx_constituents_cache.json"),
     "dow": dict(name="Dow 30", bench="DIA", port=8051, min_n=28, max_n=32, checks="close",
-                momentum="21,63,126", breadth_min=0.40, vol_target=0.0, leverage=2.5, teo_filter="on",
+                momentum="21,63,126", breadth_min=0.40, vol_target=0.0, leverage=2.5,
                 index_top=0, exclude=[], stop="none",                     # Dow: no vol target, all 30 members
                 cnbc=["https://www.cnbc.com/dow-30/", "https://www.cnbc.com/markets/dow-30/"],
                 cache="dow_constituents_cache.json"),
@@ -89,7 +87,6 @@ DEFAULTS["momentum"] = CFG["momentum"]              # 21 + 63 + 126 days
 DEFAULTS["breadth_min"] = CFG["breadth_min"]        # 40%
 DEFAULTS["vol_target"] = CFG["vol_target"]          # Nasdaq 35%, Dow off (always 100% deployed)
 DEFAULTS["leverage"] = CFG["leverage"]              # Nasdaq 2.0, Dow 2.5
-DEFAULTS["teo_filter"] = CFG["teo_filter"]          # Nasdaq off (top-30 algo has no TEO), Dow on
 ET = ZoneInfo("America/New_York")
 UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -569,37 +566,6 @@ def split_completed(close):
     return comp, live, partial
 
 
-# ───────────────────────── TEO (Trend Efficiency Oscillator) ─────────────────────────
-def teo_frame(comp, n, smooth):
-    """Signed Kaufman efficiency ratio over n days, EMA-smoothed - for every column."""
-    path = comp.diff().abs().rolling(n).sum()
-    er = (comp - comp.shift(n)) / path
-    er = er.mask(path == 0, 0.0)
-    if smooth > 1:
-        er = er.apply(lambda col: col.dropna().ewm(span=smooth, adjust=False).mean().reindex(col.index))
-    return er
-
-
-TEO_STAGES = {0: "Dormant", 1: "Building", 2: "Flat", 3: "Extended", 4: "Exhausting", 5: "Fading"}
-
-
-def teo_stage(teo, slope, flat, deep, active, dead):
-    """Same as the algo. slope = sign(TEO) x (TEO now - TEO slope-days ago): + strengthening, - weakening."""
-    mag = abs(teo)
-    if mag < dead:
-        return 0
-    if slope > flat:
-        return 3 if mag >= deep else 1
-    if slope < -flat:
-        return 5 if mag < active else 4
-    return 3 if mag >= deep else 2
-
-
-def teo_removed(stage):
-    """True if a qualifying stock is removed before ranking: TEO Exhausting."""
-    return stage == 4
-
-
 # ───────────────────────── signals (mirror of the algo) ─────────────────────────
 def lens(text):
     return [int(x) for x in str(text).split(",") if str(x).strip()]
@@ -645,24 +611,6 @@ def signals(close, p, members, hourly=None):
 
     cands = ready[ready["Qualifies"] == True].copy() if n_ready(ready) else ready  # noqa: E712
 
-    # TEO for every member (shown in the table)
-    teo = teo_frame(comp, p["teo_len"], p["teo_smooth"])
-    t_now = teo.iloc[-1]
-    t_past = teo.iloc[-1 - p["teo_slope"]] if len(teo) > p["teo_slope"] else t_now * np.nan
-    t_slope = np.sign(t_now) * (t_now - t_past)          # + = strengthening, - = weakening (direction-aware)
-    stages = {t: (teo_stage(t_now[t], t_slope[t], p["teo_flat"], p["teo_deep"], p["teo_active"], p["teo_dead"])
-                  if pd.notna(t_now.get(t)) and pd.notna(t_slope.get(t)) else None) for t in t_now.index}
-    if not df.empty:
-        df["TEO"] = df["Ticker"].map(t_now)
-        df["TEO slope"] = df["Ticker"].map(t_slope)
-        df["TEO stage"] = df["Ticker"].map(lambda t: "" if stages.get(t) is None else TEO_STAGES[stages[t]])
-
-    # TEO filter: qualifying stocks that are Exhausting are removed BEFORE ranking
-    teo_out = []
-    if p["teo_filter"] == "on" and not cands.empty:
-        out_mask = cands["Ticker"].map(lambda t: teo_removed(stages.get(t)))
-        teo_out = cands.loc[out_mask, "Ticker"].tolist()
-        cands = cands[~out_mask]
     if not cands.empty:
         if p["mom_method"] == "rank":
             score = pd.Series(0.0, index=cands.index)
@@ -729,7 +677,7 @@ def signals(close, p, members, hourly=None):
             basket_vol = max(vols.values())
             size = min(1.0, max(p["vol_min_size"], p["vol_target"] / (p["leverage"] * basket_vol)))
 
-    return dict(df=df, top=top, keep=top, teo_cash=[], teo_out=teo_out, teo=teo, n=n, n_q=n_q, share=share,
+    return dict(df=df, top=top, keep=top, n=n, n_q=n_q, share=share,
                 not_ready=not_ready, risk_off=n > 0 and share <= p["breadth_min"],
                 trips=trips, out_now=out_now, preview=preview, since=since, use_hourly=use_hourly,
                 stop_hits=stop_hits,
@@ -851,12 +799,6 @@ def build_orders(sig, p, holdings):
         if t in stopped:
             continue
         px = df.loc[t, "Price"]
-        if t in sig["teo_cash"]:
-            teo, stg = df.loc[t, "TEO"], df.loc[t, "TEO stage"]
-            rows.append(dict(Ticker=t, Action="SELL -> CASH" if t in holdings else "CASH",
-                             Why=f"Rank {i}, TEO {stg} ({teo:.2f})",
-                             Price=round(float(px), 2), **{"Target $": 0, "Shares": 0, "Margin $": 0}))
-            continue
         shares = math.floor(per_name / px) if px > 0 else 0
         act = "HOLD / RESIZE" if t in holdings else "BUY"
         rows.append(dict(Ticker=t, Action=act, Why=f"Rank {i}", Price=round(float(px), 2),
@@ -981,20 +923,9 @@ app.layout = html.Div(style={"background": BG, "minHeight": "100vh", "padding": 
         field("Fast / slow SMA", html.Div([num("fast", DEFAULTS["fast"], 1), num("slow", DEFAULTS["slow"], 1)],
                                           style={"display": "flex", "gap": "4px"})),
         field(f"{BENCH} SMA", num("market_sma", DEFAULTS["market_sma"], 1)),
-        field("TEO filter", dd("teo_filter", DEFAULTS["teo_filter"],
-                               [{"label": "on", "value": "on"}, {"label": "off", "value": "off"}], "80px")),
-        field("TEO len / smooth / slope", html.Div([num("teo_len", DEFAULTS["teo_len"], 1),
-                                                    num("teo_smooth", DEFAULTS["teo_smooth"], 1),
-                                                    num("teo_slope", DEFAULTS["teo_slope"], 1)],
-                                                   style={"display": "flex", "gap": "4px"})),
-        field("TEO flat", num("teo_flat", DEFAULTS["teo_flat"], 0.005)),
         field("Market checks", dd("checks", DEFAULTS["checks"],
                                   [{"label": "hourly", "value": "hourly"}, {"label": "at the close", "value": "close"}],
                                   "120px")),
-        field("Deep / active / dead", html.Div([num("teo_deep", DEFAULTS["teo_deep"], 0.05),
-                                                num("teo_active", DEFAULTS["teo_active"], 0.05),
-                                                num("teo_dead", DEFAULTS["teo_dead"], 0.01)],
-                                               style={"display": "flex", "gap": "4px"})),
 
         field("Current holdings (comma separated)", txt("holdings", "", "260px")),
         html.Button("Refresh data", id="refresh", n_clicks=0,
@@ -1031,15 +962,10 @@ app.layout = html.Div(style={"background": BG, "minHeight": "100vh", "padding": 
     Input("breadth_min", "value"), Input("momentum", "value"), Input("mom_method", "value"),
     Input("mom_positive", "value"), Input("fast", "value"), Input("slow", "value"), Input("market_sma", "value"),
     Input("holdings", "value"),
-    Input("teo_filter", "value"), Input("teo_len", "value"), Input("teo_smooth", "value"),
-    Input("teo_slope", "value"), Input("teo_flat", "value"), Input("teo_deep", "value"),
-    Input("teo_active", "value"), Input("teo_dead", "value"),
     State("refresh", "n_clicks_timestamp"),
 )
 def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_lookbacks, vol_min_size, top, breadth_min,
-           momentum, mom_method, mom_positive, fast, slow, market_sma, holdings,
-           teo_filter="on", teo_len=21, teo_smooth=7, teo_slope=6, teo_flat=0.02,
-           teo_deep=0.50, teo_active=0.25, teo_dead=0.10, _ts=None):
+           momentum, mom_method, mom_positive, fast, slow, market_sma, holdings, _ts=None):
     from dash import ctx
     empty = go.Figure()
     fig_layout(empty, "")
@@ -1049,11 +975,7 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
                  vol_lookbacks=vol_lookbacks or "21,63", vol_min_size=float(vol_min_size or 0),
                  top=max(int(top or 10), 1), breadth_min=float(breadth_min or 0), momentum=momentum or DEFAULTS["momentum"],
                  mom_method=mom_method, mom_positive=mom_positive, fast=int(fast or 10), slow=int(slow or 200),
-                 market_sma=int(market_sma or 200), teo_filter=teo_filter or DEFAULTS["teo_filter"],
-                 teo_len=int(teo_len or 21), teo_smooth=int(teo_smooth or 1), teo_slope=max(int(teo_slope or 6), 1),
-                 teo_flat=float(teo_flat or 0), teo_deep=float(teo_deep if teo_deep is not None else 0.5),
-                 teo_active=float(teo_active if teo_active is not None else 0.25),
-                 teo_dead=float(teo_dead if teo_dead is not None else 0.1), checks=checks or DEFAULTS["checks"])
+                 market_sma=int(market_sma or 200), checks=checks or DEFAULTS["checks"])
         try:
             trig = ctx.triggered_id
         except Exception:  # noqa: BLE001  (called outside a callback)
@@ -1146,10 +1068,6 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
                                                    f"${per_name:,.0f} per name"),
             card("Expected account vol", f"{exp_vol:.0%}", f"target {p['vol_target']:.0%}"
 ),
-            card("TEO removed", f"{len(sig['teo_out'])} of {sig['n_q']}" if p["teo_filter"] == "on" else "off",
-                 "qualifying stocks Exhausting - skipped before ranking"
-                 + (f" · {len(sig['top'])} picks left" if len(sig["top"]) < p["top"] else ""),
-                 WARN if sig["teo_out"] else GOOD),
         ]
         pe_s = pe_d["pe"] if pe_d else pd.Series(dtype=float)
         if len(pe_s):
@@ -1245,13 +1163,10 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
                 show[c] = show[c].round(1)
         if "Score" in show:
             show["Score"] = show["Score"].round(3)
-        for c in ("TEO", "TEO slope"):
-            if c in show:
-                show[c] = show[c].round(3)
         for c in ("Qualifies", "Ready"):
             if c in show:
                 show[c] = show[c].map({True: "yes", False: "no"}).fillna("")
-        show["Pick"] = show["Ticker"].map(lambda t: "★" if t in top else ("TEO out" if t in sig["teo_out"] else ""))
+        show["Pick"] = show["Ticker"].map(lambda t: "★" if t in top else "")
         caps = STATE.get("caps") or {}
         if caps:
             show["Mkt cap $B"] = show["Ticker"].map(lambda t: round(caps[t] / 1e9, 1) if caps.get(t) else None)
@@ -1264,7 +1179,7 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
         if any(v is not None for v in w.values()):
             show["Index wt %"] = show["Ticker"].map(lambda t: w.get(t))
         order_cols = [c for c in ["Pick", "Rank", "Ticker", "Price", "Qualifies", "Score"] + mcols +
-                      ["TEO", "TEO slope", "TEO stage", "SMA fast", "SMA slow", "Vs 200d %",
+                      ["SMA fast", "SMA slow", "Vs 200d %",
                        "P/E", "QQQ wt %", "Mkt cap $B", "Index wt %", "Ready"] if c in show]
         show = show[order_cols].sort_values(["Rank", "Ticker"], na_position="last")
         all_tbl = dash_table.DataTable(
@@ -1272,11 +1187,6 @@ def update(n_clicks, n_tick, checks, source, equity, leverage, vol_target, vol_l
             sort_action="native", filter_action="native", page_size=25, **TABLE_STYLE,
             style_data_conditional=[
                 {"if": {"filter_query": '{Pick} = "★"'}, "backgroundColor": "#2a2342"},
-                {"if": {"filter_query": '{Pick} = "TEO out"'}, "backgroundColor": "#3a2f1f"},
-                {"if": {"filter_query": '{TEO stage} = "Exhausting"',
-                        "column_id": "TEO stage"}, "color": WARN},
-                {"if": {"filter_query": '{TEO stage} = "Building" || {TEO stage} = "Extended"',
-                        "column_id": "TEO stage"}, "color": GOOD},
                 {"if": {"filter_query": '{Qualifies} = "no"', "column_id": "Qualifies"}, "color": BAD},
                 {"if": {"filter_query": '{Qualifies} = "yes"', "column_id": "Qualifies"}, "color": GOOD},
             ])

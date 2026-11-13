@@ -1,5 +1,6 @@
 {
  "tickers": [
+  "RKLB",
   "ABNB",
   "DASH",
   "APP",
@@ -99,11 +100,10 @@
   "CRWD",
   "DDOG",
   "EXC",
-  "PLTR",
-  "RKLB"
+  "PLTR"
  ],
  "weights": {},
  "source": "CNBC Nasdaq-100 (page data)",
- "asof": "2026-11-11",
+ "asof": "2026-11-12",
  "url": "https://www.cnbc.com/nasdaq-100/"
 }
